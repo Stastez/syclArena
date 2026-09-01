@@ -512,6 +512,7 @@ namespace cuArena {
     void DeviceArena::compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream) {
         std::vector<std::pair<addr_t, size_t>> active_blocks; // (old_ptr, size) sorted by addr
         std::vector<addr_t>                    new_ptrs;
+        size_t pre_off = 0;
         {
             std::lock_guard<std::mutex> lock(_mutex);
 
@@ -524,6 +525,10 @@ namespace cuArena {
                 _gpool.cap = _gpool.size - _stable_size;
                 return;
             }
+
+            // Everything live or freed sits below the base pointer, so the pool above
+            // its pre-compaction value is untouched and usable as copy scratch.
+            pre_off = _gpool.off;
 
             // Collect and sort active blocks by ascending address
             active_blocks.assign(_gpu_alloc_list.begin(), _gpu_alloc_list.end());
@@ -552,11 +557,33 @@ namespace cuArena {
             _gpool.cap = _gpool.size - _gpool.off;
         }
 
-        // Move data on GPU to new compacted locations.
+        // Move data on GPU to new compacted locations. Packing is downward, so a block
+        // that moves by LESS than its own size has overlapping source and destination,
+        // and cudaMemcpy* is undefined on overlapping ranges: it is a parallel copy, so
+        // which bytes survive depends on which copy blocks run first and the compaction
+        // returns different data on every run. Move those the way memmove does.
+        byte_t* scratch = static_cast<byte_t*>(_gpool.mem) + pre_off;
+        const size_t scratch_size = _gpool.size - pre_off;
+
         for (size_t i = 0; i < active_blocks.size(); ++i) {
-            if (new_ptrs[i] != active_blocks[i].first) {
-                CUARENA_CHECK(cudaMemcpyAsync(new_ptrs[i], 
-                    active_blocks[i].first, active_blocks[i].second, cudaMemcpyDeviceToDevice, stream));
+            byte_t* dst = static_cast<byte_t*>(new_ptrs[i]);
+            byte_t* src = static_cast<byte_t*>(active_blocks[i].first);
+            const size_t sz = active_blocks[i].second;
+            if (dst == src) continue;
+            const size_t delta = (size_t)(src - dst);
+
+            if (delta >= sz) {
+                CUARENA_CHECK(cudaMemcpyAsync(dst, src, sz, cudaMemcpyDeviceToDevice, stream));
+            }
+            else if (scratch_size >= sz) {
+                CUARENA_CHECK(cudaMemcpyAsync(scratch, src, sz, cudaMemcpyDeviceToDevice, stream));
+                CUARENA_CHECK(cudaMemcpyAsync(dst, scratch, sz, cudaMemcpyDeviceToDevice, stream));
+            }
+            else {
+                for (size_t off = 0; off < sz; off += delta) {
+                    const size_t len = (sz - off < delta) ? (sz - off) : delta;
+                    CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
+                }
             }
         }
 
