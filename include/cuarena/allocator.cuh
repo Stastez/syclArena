@@ -46,6 +46,12 @@ namespace cuArena {
 
         static constexpr size_t ALIGNMENT   = 128;
         static constexpr size_t MIN_SPLIT   = ALIGNMENT;
+        // Requests at or above LARGE_MIN come from a high sub-region that grows down
+        // from the pool end; smaller ones grow up from the bottom. Keeping the large
+        // blocks at one end stops small allocations stranding the contiguous space a
+        // large request needs. Nothing is relocated, so no caller pointer changes.
+        // Override at pool creation with CUARENA_LARGE_MIN_MB.
+        static constexpr size_t LARGE_MIN   = 16 * MB;
         static constexpr size_t GPU_PENALTY = 256 * MB;
         static constexpr size_t CPU_PENALTY = 512 * MB;
 
@@ -90,6 +96,14 @@ namespace cuArena {
         std::array<std::set<addr_t>, NUM_BINS>  _gpu_bins;           // size index
         std::unordered_map<addr_t, size_t>      _gpu_alloc_list;     // dynamic allocs
 
+        // High sub-region. It holds few, large blocks, so an address ordered free map
+        // with first fit and coalescing is enough and it needs no size bins.
+        size_t                             _large_min = LARGE_MIN;
+        size_t                             _gpu_hi = 0;              // its bottom, as an offset
+        std::map<addr_t, size_t>           _gpu_hi_free_by_addr;
+        std::unordered_map<addr_t, size_t> _gpu_hi_alloc_list;
+        size_t                             _gpu_hi_allocated = 0;
+
         std::map<addr_t, size_t>           _cpu_free_by_addr;
         std::map<size_t, std::set<addr_t>> _cpu_free_by_size;
         std::unordered_map<addr_t, size_t> _cpu_alloc_list;
@@ -106,6 +120,10 @@ namespace cuArena {
         addr_t _pop_gpu_free       (const size_t& size, size_t& out_size);
         addr_t _pop_cpu_free       (const size_t& size, size_t& out_size);
         addr_t _gpu_alloc          (const size_t& aligned_bytes);
+        addr_t _gpu_hi_alloc       (const size_t& aligned_bytes);
+        void   _insert_gpu_hi_free (const addr_t& ptr, const size_t& size);
+        void   _gpu_hi_free_block  (const addr_t& ptr);
+        void   _sync_gap           () noexcept { _gpool.cap = _gpu_hi - _gpool.off; }
         addr_t _stable_alloc       (const size_t& aligned_bytes);
         addr_t _cpu_alloc          (const size_t& aligned_bytes);
         void   _gpu_free_block     (const addr_t& ptr);
@@ -176,7 +194,8 @@ namespace cuArena {
                     return;
                 }
             }
-            _gpu_free_block(p);
+            if (_gpu_hi_alloc_list.count(p)) _gpu_hi_free_block(p);
+            else                             _gpu_free_block(p);
         }
 
         template<class T>
@@ -288,7 +307,7 @@ namespace cuArena {
         }
         size_t gpu_used             () const noexcept {
             std::lock_guard<std::mutex> lock(_mutex);
-            return _gpu_allocated + _gpu_stable_allocated;
+            return _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated;
         }
 
         size_t gpu_peak_used        () const noexcept {
@@ -296,21 +315,21 @@ namespace cuArena {
             return _gpu_peak;
         }
 
-        size_t gpu_available        () const noexcept {   // dynamic region
+        size_t gpu_available        () const noexcept {   // dynamic region, both ends
             std::lock_guard<std::mutex> lock(_mutex);
             size_t freed = 0;
-            for (auto& [ptr, sz] : _gpu_free_by_addr)
-                freed += sz;
-            return _gpool.cap + freed;
+            for (auto& [ptr, sz] : _gpu_free_by_addr)    freed += sz;
+            for (auto& [ptr, sz] : _gpu_hi_free_by_addr) freed += sz;
+            return _gpool.cap + freed;                   // cap is the gap between the ends
         }
 
         // Same as gpu_available() when unfragmented, 
         // but much smaller when fragmented.
         size_t gpu_largest_free_block() const noexcept {
             std::lock_guard<std::mutex> lock(_mutex);
-            size_t largest = _gpool.cap;
-            for (const auto& [ptr, sz] : _gpu_free_by_addr)
-                largest = std::max(largest, sz);
+            size_t largest = _gpool.cap;                 // the gap is itself one block
+            for (const auto& [ptr, sz] : _gpu_free_by_addr)    largest = std::max(largest, sz);
+            for (const auto& [ptr, sz] : _gpu_hi_free_by_addr) largest = std::max(largest, sz);
             return largest;
         }
 

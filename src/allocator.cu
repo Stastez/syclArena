@@ -68,8 +68,19 @@ namespace cuArena {
         }
         _stable_off = 0;
         _stable_cap = _stable_size;
+        // Read once, not per allocation. Changing it mid run would put blocks of one
+        // size class in both regions.
+        _large_min = LARGE_MIN;
+        if (const char* e = std::getenv("CUARENA_LARGE_MIN_MB")) {
+            const long long v = std::atoll(e);
+            if (v >= 0) _large_min = (size_t)v * MB;
+        }
         _gpool.off = _stable_size; // Dynamic region starts right after stable region
-        _gpool.cap = _gpool.size - _stable_size;
+        _gpu_hi    = _gpool.size;  // large blocks grow down from the pool end
+        _gpu_hi_free_by_addr.clear();
+        _gpu_hi_alloc_list.clear();
+        _gpu_hi_allocated = 0;
+        _gpool.cap = _gpu_hi - _gpool.off;   // the gap between the two ends
         _gtype   = type;
         _gstream = stream;
 
@@ -103,6 +114,9 @@ namespace cuArena {
             for (auto& bin : _gpu_bins) bin.clear();
             _gpu_alloc_list.clear();
             _gpu_allocated = 0;
+            _gpu_hi_free_by_addr.clear();
+            _gpu_hi_alloc_list.clear();
+            _gpu_hi_allocated = 0;
             _gpu_stable_free_by_addr.clear();
             _gpu_stable_alloc_list.clear();
             _gpu_stable_allocated = 0;
@@ -135,6 +149,9 @@ namespace cuArena {
             for (auto& bin : _gpu_bins) bin.clear();
             _gpu_alloc_list.clear();
             _gpu_allocated = 0;
+            _gpu_hi_free_by_addr.clear();
+            _gpu_hi_alloc_list.clear();
+            _gpu_hi_allocated = 0;
             _gpu_stable_free_by_addr.clear();
             _gpu_stable_alloc_list.clear();
             _gpu_stable_allocated = 0;
@@ -157,7 +174,8 @@ namespace cuArena {
         _stable_off  = 0;
         _stable_cap  = _stable_size;
         _gpool.off   = _stable_size;
-        _gpool.cap   = aligned - _stable_size;
+        _gpu_hi      = aligned;
+        _gpool.cap   = _gpu_hi - _gpool.off;
         _glimit      = aligned;
         _gstream     = stream;
 
@@ -188,13 +206,17 @@ namespace cuArena {
         for (auto& bin : _gpu_bins) bin.clear();
         _gpu_alloc_list.clear();
         _gpu_allocated = 0;
+        _gpu_hi_free_by_addr.clear();
+        _gpu_hi_alloc_list.clear();
+        _gpu_hi_allocated = 0;
         _gpu_stable_free_by_addr.clear();
         _gpu_stable_alloc_list.clear();
         _gpu_stable_allocated = 0;
         _stable_off  = 0;
         _stable_cap  = _stable_size;
         _gpool.off   = _stable_size; // dynamic region starts right after stable region
-        _gpool.cap   = _gpool.size - _stable_size;
+        _gpu_hi      = _gpool.size;
+        _gpool.cap   = _gpu_hi - _gpool.off;
     }
 
     bool DeviceArena::create_cpu_pool(const size_t& limit, const CPUMemoryType& type) {
@@ -399,6 +421,7 @@ namespace cuArena {
 
     addr_t DeviceArena::_gpu_alloc(const size_t& aligned_bytes) {
         assert(is_aligned(aligned_bytes));
+        if (_large_min && aligned_bytes >= _large_min) return _gpu_hi_alloc(aligned_bytes);
         size_t out_size = 0;
         addr_t ptr = _pop_gpu_free(aligned_bytes, out_size);
         if (ptr) {
@@ -408,17 +431,105 @@ namespace cuArena {
             return ptr;
         }
         if (aligned_bytes > _gpool.cap) {
-            Logger::debug("cuArena: GPU pool out of memory (dynamic region: %zu MB remaining, requested: %zu MB)",
-                         _gpool.cap / MB, aligned_bytes / MB);
-            throw gpu_memory_error("GPU pool out of memory");
+            // Report the request size. A caller that catches this needs to tell a full
+            // pool from one merely too fragmented to serve this block.
+            size_t largest_free = 0;
+            for (const auto& kv : _gpu_free_by_addr) largest_free = std::max(largest_free, kv.second);
+            const std::string msg = "GPU pool out of memory (requested " +
+                std::to_string(aligned_bytes / MB) + " MB, bump tail " +
+                std::to_string(_gpool.cap / MB) + " MB, largest free block " +
+                std::to_string(largest_free / MB) + " MB)";
+            Logger::debug("cuArena: %s", msg.c_str());
+            throw gpu_memory_error(msg.c_str());
         }
         ptr = static_cast<byte_t*>(_gpool.mem) + _gpool.off;
         _gpool.off += aligned_bytes;
-        _gpool.cap -= aligned_bytes;
+        _sync_gap();
         _gpu_alloc_list.emplace(ptr, aligned_bytes);
         _gpu_allocated += aligned_bytes;
         _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_stable_allocated);
         return ptr;
+    }
+
+    // Large blocks. First fit over the high free list, else carve down from its bottom.
+    addr_t DeviceArena::_gpu_hi_alloc(const size_t& aligned_bytes) {
+        for (auto it = _gpu_hi_free_by_addr.begin(); it != _gpu_hi_free_by_addr.end(); ++it) {
+            if (it->second < aligned_bytes) continue;
+            addr_t block = it->first;
+            const size_t block_size = it->second;
+            _gpu_hi_free_by_addr.erase(it);          // it is dead here; the loop returns below
+            size_t took = block_size;
+            // Split from the top of the hole so the remainder stays at its low end.
+            if (block_size >= aligned_bytes + MIN_SPLIT) {
+                _gpu_hi_free_by_addr.emplace(block, block_size - aligned_bytes);
+                block = static_cast<byte_t*>(block) + (block_size - aligned_bytes);
+                took = aligned_bytes;
+            }
+            _gpu_hi_alloc_list.emplace(block, took);
+            _gpu_hi_allocated += took;
+            _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
+            return block;
+        }
+
+        if (_gpu_hi < _gpool.off + aligned_bytes) {
+            Logger::debug("cuArena: GPU pool out of memory (high region: gap %zu MB, requested %zu MB)",
+                          (_gpu_hi - _gpool.off) / MB, aligned_bytes / MB);
+            const std::string msg = "GPU pool out of memory (requested " +
+                std::to_string(aligned_bytes / MB) + " MB large-region, shared gap " +
+                std::to_string((_gpu_hi - _gpool.off) / MB) + " MB)";
+            throw gpu_memory_error(msg.c_str());
+        }
+        _gpu_hi -= aligned_bytes;
+        _sync_gap();
+        addr_t ptr = static_cast<byte_t*>(_gpool.mem) + _gpu_hi;
+        _gpu_hi_alloc_list.emplace(ptr, aligned_bytes);
+        _gpu_hi_allocated += aligned_bytes;
+        _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
+        return ptr;
+    }
+
+    // Coalesce into the high free list, then rewind the region bottom past a free run
+    // sitting at it so the gap grows back.
+    void DeviceArena::_insert_gpu_hi_free(const addr_t& ptr, const size_t& size) {
+        auto [it, ok] = _gpu_hi_free_by_addr.emplace(ptr, size);
+        if (!ok) {
+            Logger::debug("cuArena: double free in high region %p", ptr);
+            throw gpu_memory_error("double free in the large-block region");
+        }
+        auto next = std::next(it);
+        if (next != _gpu_hi_free_by_addr.end() &&
+            static_cast<byte_t*>(it->first) + it->second == static_cast<byte_t*>(next->first)) {
+            it->second += next->second;
+            _gpu_hi_free_by_addr.erase(next);
+        }
+        if (it != _gpu_hi_free_by_addr.begin()) {
+            auto prev = std::prev(it);
+            if (static_cast<byte_t*>(prev->first) + prev->second == static_cast<byte_t*>(it->first)) {
+                prev->second += it->second;
+                _gpu_hi_free_by_addr.erase(it);
+                it = prev;
+            }
+        }
+        byte_t* base = static_cast<byte_t*>(_gpool.mem);
+        auto bottom = _gpu_hi_free_by_addr.begin();
+        if (bottom != _gpu_hi_free_by_addr.end() &&
+            (size_t)(static_cast<byte_t*>(bottom->first) - base) == _gpu_hi) {
+            _gpu_hi += bottom->second;
+            _gpu_hi_free_by_addr.erase(bottom);
+            _sync_gap();
+        }
+    }
+
+    void DeviceArena::_gpu_hi_free_block(const addr_t& ptr) {
+        auto it = _gpu_hi_alloc_list.find(ptr);
+        if (it == _gpu_hi_alloc_list.end()) {
+            Logger::debug("deallocate: pointer %p not in the high alloc list", ptr);
+            throw gpu_memory_error("invalid pointer in freeing GPU block");
+        }
+        const size_t size = it->second;
+        _gpu_hi_alloc_list.erase(it);
+        _gpu_hi_allocated -= size;
+        _insert_gpu_hi_free(ptr, size);
     }
 
     void DeviceArena::_gpu_free_block(const addr_t& ptr) {
@@ -509,6 +620,8 @@ namespace cuArena {
         }
     }
 
+    // Compacts the low region only. High blocks already coalesce and rewind on free,
+    // and leaving them in place keeps the caller's large base pointers valid.
     void DeviceArena::compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream) {
         std::vector<std::pair<addr_t, size_t>> active_blocks; // (old_ptr, size) sorted by addr
         std::vector<addr_t>                    new_ptrs;
@@ -517,12 +630,12 @@ namespace cuArena {
             std::lock_guard<std::mutex> lock(_mutex);
 
             if (_gpu_alloc_list.empty()) {
-                // No dynamic allocs: discard all fragmentation holes by resetting
-                // the region pointer to the start of the dynamic region.
+                // No small allocs: discard the low region's holes. The high region
+                // compacts through its own rewind on free, not here.
                 _gpu_free_by_addr.clear();
                 for (auto& bin : _gpu_bins) bin.clear();
                 _gpool.off = _stable_size;
-                _gpool.cap = _gpool.size - _stable_size;
+                _gpool.cap = _gpu_hi - _gpool.off;
                 return;
             }
 
@@ -554,16 +667,20 @@ namespace cuArena {
                 _gpu_allocated += active_blocks[i].second;
             }
             _gpool.off = _stable_size + new_off;
-            _gpool.cap = _gpool.size - _gpool.off;
+            _gpool.cap = _gpu_hi - _gpool.off;   // the gap, not the whole tail
         }
 
-        // Move data on GPU to new compacted locations. Packing is downward, so a block
-        // that moves by LESS than its own size has overlapping source and destination,
-        // and cudaMemcpy* is undefined on overlapping ranges: it is a parallel copy, so
-        // which bytes survive depends on which copy blocks run first and the compaction
-        // returns different data on every run. Move those the way memmove does.
+        // Move data to the new locations. Packing is downward, so a block that moves by
+        // less than its own size has overlapping source and destination, and cudaMemcpy
+        // is undefined on overlapping ranges: it is a parallel copy, so which bytes
+        // survive depends on which copy blocks run first, and the result differs between
+        // runs. Handle those like memmove: through the gap when the block fits in it,
+        // otherwise in ascending chunks of delta, each disjoint and ordered against the
+        // previous by the stream.
+        // Scratch is the gap only. Everything above _gpu_hi belongs to the high region,
+        // which this compaction must not touch.
         byte_t* scratch = static_cast<byte_t*>(_gpool.mem) + pre_off;
-        const size_t scratch_size = _gpool.size - pre_off;
+        const size_t scratch_size = (_gpu_hi > pre_off) ? (_gpu_hi - pre_off) : 0;
 
         for (size_t i = 0; i < active_blocks.size(); ++i) {
             byte_t* dst = static_cast<byte_t*>(new_ptrs[i]);
