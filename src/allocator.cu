@@ -427,7 +427,7 @@ namespace cuArena {
         if (ptr) {
             _gpu_alloc_list.emplace(ptr, out_size);
             _gpu_allocated += out_size;
-            _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_stable_allocated);
+            _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
             return ptr;
         }
         if (aligned_bytes > _gpool.cap) {
@@ -447,7 +447,7 @@ namespace cuArena {
         _sync_gap();
         _gpu_alloc_list.emplace(ptr, aligned_bytes);
         _gpu_allocated += aligned_bytes;
-        _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_stable_allocated);
+        _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
         return ptr;
     }
 
@@ -562,7 +562,7 @@ namespace cuArena {
                 }
                 _gpu_stable_alloc_list.emplace(block, block_size);
                 _gpu_stable_allocated += block_size;
-                _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_stable_allocated);
+                _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
                 return block;
             }
         }
@@ -578,7 +578,7 @@ namespace cuArena {
         _stable_cap -= aligned_bytes;
         _gpu_stable_alloc_list.emplace(ptr, aligned_bytes);
         _gpu_stable_allocated += aligned_bytes;
-        _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_stable_allocated);
+        _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
         return ptr;
     }
 
