@@ -34,6 +34,16 @@ namespace cuArena {
         size_t off  = 0;
     };
 
+    // Where the free bytes sit. A large request can only come from the gap or a high
+    // hole, so the split says whether packing the high region would reach one; live_*
+    // is how many base pointers that would move.
+    struct FreeHighRegion {
+        size_t gap = 0;
+        size_t low_free = 0, hi_free = 0;
+        size_t low_largest = 0, hi_largest = 0;
+        size_t low_live = 0, hi_live = 0;
+    };
+
     struct gpu_memory_error : std::runtime_error {
         explicit gpu_memory_error(const char* msg) : std::runtime_error(msg) {}
     };
@@ -103,6 +113,7 @@ namespace cuArena {
         std::map<addr_t, size_t>           _gpu_hi_free_by_addr;
         std::unordered_map<addr_t, size_t> _gpu_hi_alloc_list;
         size_t                             _gpu_hi_allocated = 0;
+        size_t                             _gpu_hi_serves = 0;      // large requests served, ever
 
         std::map<addr_t, size_t>           _cpu_free_by_addr;
         std::map<size_t, std::set<addr_t>> _cpu_free_by_size;
@@ -121,6 +132,18 @@ namespace cuArena {
         addr_t _pop_cpu_free       (const size_t& size, size_t& out_size);
         addr_t _gpu_alloc          (const size_t& aligned_bytes);
         addr_t _gpu_hi_alloc       (const size_t& aligned_bytes);
+        // Plan a region's packing under the lock: `blocks` in the order they must move,
+        // `new_ptrs` their destinations, plus the bounce buffer. Rebuilds that region's
+        // alloc/free bookkeeping.
+        void   _plan_compact_low   (std::vector<std::pair<addr_t, size_t>>& blocks,
+                                    std::vector<addr_t>& new_ptrs,
+                                    byte_t*& bounce, size_t& bounce_size);
+        void   _plan_compact_high  (std::vector<std::pair<addr_t, size_t>>& blocks,
+                                    std::vector<addr_t>& new_ptrs,
+                                    byte_t*& bounce, size_t& bounce_size);
+        // Moves one block with memmove semantics, in either direction.
+        void   _move_block         (byte_t* dst, byte_t* src, size_t sz, byte_t* bounce,
+                                    size_t bounce_size, cudaStream_t stream);
         void   _insert_gpu_hi_free (const addr_t& ptr, const size_t& size);
         void   _gpu_hi_free_block  (const addr_t& ptr);
         void   _sync_gap           () noexcept { _gpool.cap = _gpu_hi - _gpool.off; }
@@ -267,14 +290,15 @@ namespace cuArena {
         }
 
         /**
-         * GPU compaction and pointer relocation
+         * GPU compaction and pointer relocation.
          *
-         * defrags dynamic-region allocations towards the front of
-         * the dynamic region, eliminating fragmentation holes.
-         * The caller must synchronize `stream` before accessing GPU data
-         * through the new pointers.
+         * Packs one end of the dynamic pool, closing that region's holes: Low (the
+         * default) slides the small blocks to the front, High slides the large blocks
+         * to the pool end so their holes merge into the shared gap. Returns the number
+         * of blocks relocated; sync `stream` before using the new pointers.
          */
-        void compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream = 0);
+        size_t compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream = 0,
+                                   CompactRegion which = CompactRegion::Low);
 
         addr_t gpu_base             () const noexcept { return _gpool.mem; }
         size_t gpu_capacity         () const noexcept { return _gpool.size; }
@@ -331,6 +355,30 @@ namespace cuArena {
             for (const auto& [ptr, sz] : _gpu_free_by_addr)    largest = std::max(largest, sz);
             for (const auto& [ptr, sz] : _gpu_hi_free_by_addr) largest = std::max(largest, sz);
             return largest;
+        }
+
+        // Large requests served, ever. The multiplier on any per-allocation scheme.
+        size_t gpu_hi_serves() const noexcept {
+            std::lock_guard<std::mutex> lock(_mutex);
+            return _gpu_hi_serves;
+        }
+
+        // The per-region breakdown behind gpu_available()/gpu_largest_free_block().
+        FreeHighRegion gpu_free_high_region() const noexcept {
+            std::lock_guard<std::mutex> lock(_mutex);
+            FreeHighRegion fp;
+            fp.gap = _gpool.cap;
+            for (const auto& [ptr, sz] : _gpu_free_by_addr) {
+                fp.low_free += sz;
+                fp.low_largest = std::max(fp.low_largest, sz);
+            }
+            for (const auto& [ptr, sz] : _gpu_hi_free_by_addr) {
+                fp.hi_free += sz;
+                fp.hi_largest = std::max(fp.hi_largest, sz);
+            }
+            fp.low_live = _gpu_alloc_list.size();
+            fp.hi_live = _gpu_hi_alloc_list.size();
+            return fp;
         }
 
         size_t cpu_capacity () const noexcept { return _cpool.size; }

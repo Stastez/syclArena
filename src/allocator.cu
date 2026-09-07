@@ -80,6 +80,7 @@ namespace cuArena {
         _gpu_hi_free_by_addr.clear();
         _gpu_hi_alloc_list.clear();
         _gpu_hi_allocated = 0;
+        _gpu_hi_serves = 0;
         _gpool.cap = _gpu_hi - _gpool.off;   // the gap between the two ends
         _gtype   = type;
         _gstream = stream;
@@ -117,6 +118,7 @@ namespace cuArena {
             _gpu_hi_free_by_addr.clear();
             _gpu_hi_alloc_list.clear();
             _gpu_hi_allocated = 0;
+            _gpu_hi_serves = 0;
             _gpu_stable_free_by_addr.clear();
             _gpu_stable_alloc_list.clear();
             _gpu_stable_allocated = 0;
@@ -152,6 +154,7 @@ namespace cuArena {
             _gpu_hi_free_by_addr.clear();
             _gpu_hi_alloc_list.clear();
             _gpu_hi_allocated = 0;
+            _gpu_hi_serves = 0;
             _gpu_stable_free_by_addr.clear();
             _gpu_stable_alloc_list.clear();
             _gpu_stable_allocated = 0;
@@ -209,6 +212,7 @@ namespace cuArena {
         _gpu_hi_free_by_addr.clear();
         _gpu_hi_alloc_list.clear();
         _gpu_hi_allocated = 0;
+        _gpu_hi_serves = 0;
         _gpu_stable_free_by_addr.clear();
         _gpu_stable_alloc_list.clear();
         _gpu_stable_allocated = 0;
@@ -467,6 +471,7 @@ namespace cuArena {
             }
             _gpu_hi_alloc_list.emplace(block, took);
             _gpu_hi_allocated += took;
+            ++_gpu_hi_serves;
             _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
             return block;
         }
@@ -484,6 +489,7 @@ namespace cuArena {
         addr_t ptr = static_cast<byte_t*>(_gpool.mem) + _gpu_hi;
         _gpu_hi_alloc_list.emplace(ptr, aligned_bytes);
         _gpu_hi_allocated += aligned_bytes;
+        ++_gpu_hi_serves;
         _gpu_peak = std::max(_gpu_peak, _gpu_allocated + _gpu_hi_allocated + _gpu_stable_allocated);
         return ptr;
     }
@@ -620,96 +626,154 @@ namespace cuArena {
         }
     }
 
-    // Compacts the low region only. High blocks already coalesce and rewind on free,
-    // and leaving them in place keeps the caller's large base pointers valid.
-    void DeviceArena::compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream) {
-        std::vector<std::pair<addr_t, size_t>> active_blocks; // (old_ptr, size) sorted by addr
-        std::vector<addr_t>                    new_ptrs;
-        size_t pre_off = 0;
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
+    // Move order for the low region.
+    static bool by_addr_asc(const std::pair<addr_t, size_t>& a, const std::pair<addr_t, size_t>& b) {
+        return a.first < b.first;
+    }
 
-            if (_gpu_alloc_list.empty()) {
-                // No small allocs: discard the low region's holes. The high region
-                // compacts through its own rewind on free, not here.
-                _gpu_free_by_addr.clear();
-                for (auto& bin : _gpu_bins) bin.clear();
-                _gpool.off = _stable_size;
-                _gpool.cap = _gpu_hi - _gpool.off;
-                return;
-            }
+    // Move order for the high region.
+    static bool by_addr_desc(const std::pair<addr_t, size_t>& a, const std::pair<addr_t, size_t>& b) {
+        return a.first > b.first;
+    }
 
-            // Everything live or freed sits below the base pointer, so the pool above
-            // its pre-compaction value is untouched and usable as copy scratch.
-            pre_off = _gpool.off;
-
-            // Collect and sort active blocks by ascending address
-            active_blocks.assign(_gpu_alloc_list.begin(), _gpu_alloc_list.end());
-            std::sort(active_blocks.begin(), active_blocks.end(),
-                      [](const auto& a, const auto& b) { return a.first < b.first; });
-
-            // Compact: pack from dynamic start forward, no gaps
-            byte_t* dyn_start = static_cast<byte_t*>(_gpool.mem) + _stable_size;
-            size_t  new_off   = 0;
-            new_ptrs.reserve(active_blocks.size());
-            for (auto& [old_ptr, sz] : active_blocks) {
-                new_ptrs.push_back(dyn_start + new_off);
-                new_off += sz;
-            }
-
-            // Rebuild alloc list and free list to reflect new packed layout
+    // Pack the small blocks towards the front of the dynamic region.
+    void DeviceArena::_plan_compact_low(std::vector<std::pair<addr_t, size_t>>& blocks,
+                                        std::vector<addr_t>& new_ptrs,
+                                        byte_t*& bounce, size_t& bounce_size) {
+        if (_gpu_alloc_list.empty()) {
+            // No small allocs: discard the low region's holes outright.
             _gpu_free_by_addr.clear();
             for (auto& bin : _gpu_bins) bin.clear();
-            _gpu_alloc_list.clear();
-            _gpu_allocated = 0;
-            for (size_t i = 0; i < active_blocks.size(); ++i) {
-                _gpu_alloc_list.emplace(new_ptrs[i], active_blocks[i].second);
-                _gpu_allocated += active_blocks[i].second;
-            }
-            _gpool.off = _stable_size + new_off;
-            _gpool.cap = _gpu_hi - _gpool.off;   // the gap, not the whole tail
+            _gpool.off = _stable_size;
+            _sync_gap();
+            return;
         }
 
-        // Move data to the new locations. Packing is downward, so a block that moves by
-        // less than its own size has overlapping source and destination, and cudaMemcpy
-        // is undefined on overlapping ranges: it is a parallel copy, so which bytes
-        // survive depends on which copy blocks run first, and the result differs between
-        // runs. Handle those like memmove: through the gap when the block fits in it,
-        // otherwise in ascending chunks of delta, each disjoint and ordered against the
-        // previous by the stream.
-        // Scratch is the gap only. Everything above _gpu_hi belongs to the high region,
-        // which this compaction must not touch.
-        byte_t* scratch = static_cast<byte_t*>(_gpool.mem) + pre_off;
-        const size_t scratch_size = (_gpu_hi > pre_off) ? (_gpu_hi - pre_off) : 0;
+        // The gap above the base pointer is free and belongs to neither region, so it can
+        // hold the bounce for an overlapping copy.
+        const size_t pre_off = _gpool.off;
+        bounce = static_cast<byte_t*>(_gpool.mem) + pre_off;
+        bounce_size = (_gpu_hi > pre_off) ? (_gpu_hi - pre_off) : 0;
+
+        blocks.assign(_gpu_alloc_list.begin(), _gpu_alloc_list.end());
+        std::sort(blocks.begin(), blocks.end(), by_addr_asc);
+
+        byte_t* dyn_start = static_cast<byte_t*>(_gpool.mem) + _stable_size;
+        size_t  new_off   = 0;
+        new_ptrs.reserve(blocks.size());
+        for (auto& [old_ptr, sz] : blocks) {
+            new_ptrs.push_back(dyn_start + new_off);
+            new_off += sz;
+        }
+
+        _gpu_free_by_addr.clear();
+        for (auto& bin : _gpu_bins) bin.clear();
+        _gpu_alloc_list.clear();
+        _gpu_allocated = 0;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            _gpu_alloc_list.emplace(new_ptrs[i], blocks[i].second);
+            _gpu_allocated += blocks[i].second;
+        }
+        _gpool.off = _stable_size + new_off;
+        _sync_gap();
+    }
+
+    // Pack the large blocks towards the pool end, so their holes end up at the region's
+    // bottom and merge into the gap. Packing the other way would eat the gap instead.
+    void DeviceArena::_plan_compact_high(std::vector<std::pair<addr_t, size_t>>& blocks,
+                                         std::vector<addr_t>& new_ptrs,
+                                         byte_t*& bounce, size_t& bounce_size) {
+        if (_gpu_hi_alloc_list.empty()) {
+            _gpu_hi_free_by_addr.clear();
+            _gpu_hi = _gpool.size;
+            _sync_gap();
+            return;
+        }
+
+        // Packing upwards moves every block up, so nothing lands below the region's old
+        // bottom and the gap under it is free to bounce an overlapping copy through.
+        const size_t pre_hi = _gpu_hi;
+        bounce = static_cast<byte_t*>(_gpool.mem) + _gpool.off;
+        bounce_size = (pre_hi > _gpool.off) ? (pre_hi - _gpool.off) : 0;
+
+        blocks.assign(_gpu_hi_alloc_list.begin(), _gpu_hi_alloc_list.end());
+        std::sort(blocks.begin(), blocks.end(), by_addr_desc);
+
+        size_t packed_bottom = _gpool.size;
+        new_ptrs.reserve(blocks.size());
+        for (auto& [old_ptr, sz] : blocks) {
+            packed_bottom -= sz;
+            new_ptrs.push_back(static_cast<byte_t*>(_gpool.mem) + packed_bottom);
+        }
+
+        _gpu_hi_free_by_addr.clear();
+        _gpu_hi_alloc_list.clear();
+        _gpu_hi_allocated = 0;
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            _gpu_hi_alloc_list.emplace(new_ptrs[i], blocks[i].second);
+            _gpu_hi_allocated += blocks[i].second;
+        }
+        _gpu_hi = packed_bottom;
+        _sync_gap();
+    }
+
+    // cudaMemcpy is undefined where source and destination overlap, which happens when a
+    // block moves by less than its own size. Route those through the bounce buffer, or
+    // copy in disjoint chunks of delta. Ascending moving down, descending moving up, so
+    // each chunk is read before anything overwrites it.
+    void DeviceArena::_move_block(byte_t* dst, byte_t* src, size_t sz, byte_t* bounce,
+                                  size_t bounce_size, cudaStream_t stream) {
+        if (dst == src) return;
+
+        const size_t delta = (dst < src) ? (size_t)(src - dst) : (size_t)(dst - src);
+        if (delta >= sz) {
+            CUARENA_CHECK(cudaMemcpyAsync(dst, src, sz, cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
+        if (bounce_size >= sz) {
+            CUARENA_CHECK(cudaMemcpyAsync(bounce, src, sz, cudaMemcpyDeviceToDevice, stream));
+            CUARENA_CHECK(cudaMemcpyAsync(dst, bounce, sz, cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
+        if (dst < src) {
+            for (size_t off = 0; off < sz; off += delta) {
+                const size_t len = (sz - off < delta) ? (sz - off) : delta;
+                CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+        else {
+            for (size_t off = sz; off > 0; ) {
+                const size_t len = (off < delta) ? off : delta;
+                off -= len;
+                CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+
+    size_t DeviceArena::compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream,
+                                            CompactRegion which) {
+        std::vector<std::pair<addr_t, size_t>> active_blocks;  // in move order
+        std::vector<addr_t>                    new_ptrs;
+        byte_t*                                bounce = nullptr;
+        size_t                                 bounce_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (which == CompactRegion::High) _plan_compact_high(active_blocks, new_ptrs, bounce, bounce_size);
+            else                              _plan_compact_low(active_blocks, new_ptrs, bounce, bounce_size);
+        }
 
         for (size_t i = 0; i < active_blocks.size(); ++i) {
-            byte_t* dst = static_cast<byte_t*>(new_ptrs[i]);
-            byte_t* src = static_cast<byte_t*>(active_blocks[i].first);
-            const size_t sz = active_blocks[i].second;
-            if (dst == src) continue;
-            const size_t delta = (size_t)(src - dst);
-
-            if (delta >= sz) {
-                CUARENA_CHECK(cudaMemcpyAsync(dst, src, sz, cudaMemcpyDeviceToDevice, stream));
-            }
-            else if (scratch_size >= sz) {
-                CUARENA_CHECK(cudaMemcpyAsync(scratch, src, sz, cudaMemcpyDeviceToDevice, stream));
-                CUARENA_CHECK(cudaMemcpyAsync(dst, scratch, sz, cudaMemcpyDeviceToDevice, stream));
-            }
-            else {
-                for (size_t off = 0; off < sz; off += delta) {
-                    const size_t len = (sz - off < delta) ? (sz - off) : delta;
-                    CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
-                }
-            }
+            _move_block(static_cast<byte_t*>(new_ptrs[i]), static_cast<byte_t*>(active_blocks[i].first),
+                        active_blocks[i].second, bounce, bounce_size, stream);
         }
 
-        // Invoke callbacks (CPU-side pointer updates).
-        if (callback) {
-            for (size_t i = 0; i < active_blocks.size(); ++i) {
-                callback(active_blocks[i].first, new_ptrs[i], active_blocks[i].second);
-            }
+        size_t moved = 0;
+        for (size_t i = 0; i < active_blocks.size(); ++i) {
+            if (new_ptrs[i] == active_blocks[i].first) continue;
+            ++moved;
+            if (callback) callback(active_blocks[i].first, new_ptrs[i], active_blocks[i].second);
         }
+        return moved;
     }
 
     void DeviceArena::_insert_cpu_free(const addr_t& ptr, const size_t& size) {

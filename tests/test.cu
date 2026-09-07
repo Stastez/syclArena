@@ -631,6 +631,133 @@ void test_compact(cudaStream_t stream) {
     });
 }
 
+void test_compact_high(cudaStream_t stream) {
+    section("Compact (high region)");
+
+    run_test("compact high reclaims a stranded hole", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Device, stream));
+        // Large blocks (>= LARGE_MIN) carve DOWN from the pool end: A on top, then B, C.
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(64 * cuArena::MB / sizeof(float));
+        float* C = a.allocate<float>(64 * cuArena::MB / sizeof(float));
+        TCHECK(A > B && B > C);
+        // Freeing the TOP block strands its 32 MB: the rewind only reaches a free run at
+        // the region bottom, which is where C still sits.
+        a.deallocate(A);
+        const size_t free_before = a.gpu_available();
+        const size_t largest_before = a.gpu_largest_free_block();
+        // 128 MB free, but in two runs of 96 and 32, so a 120 MB request cannot be served.
+        TCHECK(free_before > largest_before);
+        bool threw = false;
+        try { a.allocate<float>(120 * cuArena::MB / sizeof(float)); }
+        catch (const cuArena::gpu_memory_error&) { threw = true; }
+        TCHECK(threw);
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        const size_t n = a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, stream, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaStreamSynchronize(stream));
+
+        // Both live blocks slid up, and every free byte is now one run.
+        TCHECK(n == 2);
+        TCHECK(a.gpu_available() >= free_before);
+        TCHECK(a.gpu_largest_free_block() == a.gpu_available());
+
+        float* nB = static_cast<float*>(moved[B]);
+        float* nC = static_cast<float*>(moved[C]);
+        TCHECK(nB > B && nC > C);
+
+        // ...and the request that could not be served now can be.
+        float* big = a.allocate<float>(120 * cuArena::MB / sizeof(float));
+        TCHECK(big != nullptr);
+        a.deallocate(big);
+
+        a.deallocate(nB);
+        a.deallocate(nC);
+    });
+
+    run_test("compact high leaves the low region alone", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Device, stream));
+        float* small = a.allocate<float>(8 * cuArena::MB / sizeof(float));
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        a.deallocate(A);
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, stream, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaStreamSynchronize(stream));
+
+        TCHECK(moved.find(small) == moved.end());
+        float* nB = moved.count(B) ? static_cast<float*>(moved[B]) : B;
+        a.deallocate(nB);
+        a.deallocate(small);
+    });
+
+    // The subtle path: packing UP means source and destination overlap whenever a block
+    // moves by less than its own size, and here the gap is too small to stage the copy
+    // through, so it has to go in DESCENDING chunks of delta.
+    run_test("compact high preserves data through an overlapping move", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Managed));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        const size_t nfloat = 64 * cuArena::MB / sizeof(float);
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(nfloat);
+        float* C = a.allocate<float>(nfloat);
+        // 48 MB of small blocks shrink the shared gap below one large block, so the
+        // scratch route is unavailable and the chunked path is taken.
+        float* s1 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
+        float* s2 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
+        float* s3 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
+        float* s4 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
+        a.deallocate(A);
+
+        // A pattern that is wrong if ANY chunk lands out of order.
+        const size_t stride = 4096;
+        for (size_t i = 0; i < nfloat; i += stride) {
+            B[i] = (float)(i + 1);
+            C[i] = -(float)(i + 1);
+        }
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, nullptr, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        float* nB = static_cast<float*>(moved[B]);
+        float* nC = static_cast<float*>(moved[C]);
+        // Each really did move up by less than its own size.
+        TCHECK((size_t)((char*)nB - (char*)B) < 64 * cuArena::MB);
+        TCHECK((size_t)((char*)nC - (char*)C) < 64 * cuArena::MB);
+        bool ok = true;
+        for (size_t i = 0; i < nfloat; i += stride) {
+            if (nB[i] != (float)(i + 1)) ok = false;
+            if (nC[i] != -(float)(i + 1)) ok = false;
+        }
+        TCHECK(ok);
+
+        // And the reclaimed space is usable as one block.
+        float* big = a.allocate<float>(64 * cuArena::MB / sizeof(float));
+        TCHECK(big != nullptr);
+        a.deallocate(big);
+
+        a.deallocate(nB);
+        a.deallocate(nC);
+        a.deallocate(s1);
+        a.deallocate(s2);
+        a.deallocate(s3);
+        a.deallocate(s4);
+    });
+}
+
 void test_mixed_stable_dynamic(cudaStream_t stream) {
     section("Mixed stable + dynamic");
 
@@ -742,6 +869,7 @@ int main() {
     test_stable_region(stream);
     test_dynamic_bins(stream);
     test_compact(stream);
+    test_compact_high(stream);
     test_mixed_stable_dynamic(stream);
 
     CUARENA_CHECK(cudaStreamDestroy(stream));

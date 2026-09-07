@@ -14,5 +14,7 @@ namespace cuArena {
     enum class GPUMemoryType { Device, Managed };
     enum class CPUMemoryType { Pinned, Pageable };
     enum class Region        { Stable, Dynamic  };
+    // Which end of the dynamic pool compact_gpu_dynamic packs.
+    enum class CompactRegion { Low, High };
 
 }
