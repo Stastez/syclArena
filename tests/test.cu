@@ -637,17 +637,17 @@ void test_compact_high(cudaStream_t stream) {
     run_test("compact high reclaims a stranded hole", [&] {
         cuArena::DeviceArena a;
         TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Device, stream));
-        // Large blocks (>= LARGE_MIN) carve DOWN from the pool end: A on top, then B, C.
+        // Large blocks carve down from the pool end, so A is on top, then B, then C.
         float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
         float* B = a.allocate<float>(64 * cuArena::MB / sizeof(float));
         float* C = a.allocate<float>(64 * cuArena::MB / sizeof(float));
         TCHECK(A > B && B > C);
-        // Freeing the TOP block strands its 32 MB: the rewind only reaches a free run at
-        // the region bottom, which is where C still sits.
+        // Freeing the top block strands its 32 MB. Only a free run at the region
+        // bottom rewinds, and C is sitting there.
         a.deallocate(A);
         const size_t free_before = a.gpu_available();
         const size_t largest_before = a.gpu_largest_free_block();
-        // 128 MB free, but in two runs of 96 and 32, so a 120 MB request cannot be served.
+        // 128 MB free, but split 96 and 32, so 120 MB cannot be served.
         TCHECK(free_before > largest_before);
         bool threw = false;
         try { a.allocate<float>(120 * cuArena::MB / sizeof(float)); }
@@ -660,7 +660,7 @@ void test_compact_high(cudaStream_t stream) {
         }, stream, cuArena::CompactRegion::High);
         CUARENA_CHECK(cudaStreamSynchronize(stream));
 
-        // Both live blocks slid up, and every free byte is now one run.
+        // Both blocks moved up, and all the free space is one run now.
         TCHECK(n == 2);
         TCHECK(a.gpu_available() >= free_before);
         TCHECK(a.gpu_largest_free_block() == a.gpu_available());
@@ -669,7 +669,7 @@ void test_compact_high(cudaStream_t stream) {
         float* nC = static_cast<float*>(moved[C]);
         TCHECK(nB > B && nC > C);
 
-        // ...and the request that could not be served now can be.
+        // The request that failed above now fits.
         float* big = a.allocate<float>(120 * cuArena::MB / sizeof(float));
         TCHECK(big != nullptr);
         a.deallocate(big);
@@ -698,9 +698,8 @@ void test_compact_high(cudaStream_t stream) {
         a.deallocate(small);
     });
 
-    // The subtle path: packing UP means source and destination overlap whenever a block
-    // moves by less than its own size, and here the gap is too small to stage the copy
-    // through, so it has to go in DESCENDING chunks of delta.
+    // Packing up makes a block overlap itself when it moves less than its own size.
+    // The gap here is too small to bounce through, so the chunked path runs.
     run_test("compact high preserves data through an overlapping move", [&] {
         cuArena::DeviceArena a;
         TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Managed));
@@ -710,15 +709,14 @@ void test_compact_high(cudaStream_t stream) {
         float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
         float* B = a.allocate<float>(nfloat);
         float* C = a.allocate<float>(nfloat);
-        // 48 MB of small blocks shrink the shared gap below one large block, so the
-        // scratch route is unavailable and the chunked path is taken.
+        // 48 MB of small blocks leave the gap smaller than one large block.
         float* s1 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
         float* s2 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
         float* s3 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
         float* s4 = a.allocate<float>(12 * cuArena::MB / sizeof(float));
         a.deallocate(A);
 
-        // A pattern that is wrong if ANY chunk lands out of order.
+        // This pattern comes out wrong if any chunk lands out of order.
         const size_t stride = 4096;
         for (size_t i = 0; i < nfloat; i += stride) {
             B[i] = (float)(i + 1);
@@ -734,7 +732,7 @@ void test_compact_high(cudaStream_t stream) {
 
         float* nB = static_cast<float*>(moved[B]);
         float* nC = static_cast<float*>(moved[C]);
-        // Each really did move up by less than its own size.
+        // Confirm both moved up by less than their own size.
         TCHECK((size_t)((char*)nB - (char*)B) < 64 * cuArena::MB);
         TCHECK((size_t)((char*)nC - (char*)C) < 64 * cuArena::MB);
         bool ok = true;
@@ -744,7 +742,7 @@ void test_compact_high(cudaStream_t stream) {
         }
         TCHECK(ok);
 
-        // And the reclaimed space is usable as one block.
+        // The reclaimed space is one usable block.
         float* big = a.allocate<float>(64 * cuArena::MB / sizeof(float));
         TCHECK(big != nullptr);
         a.deallocate(big);
@@ -755,6 +753,188 @@ void test_compact_high(cudaStream_t stream) {
         a.deallocate(s2);
         a.deallocate(s3);
         a.deallocate(s4);
+    });
+}
+
+void test_compact_high_corners(cudaStream_t stream) {
+    section("Compact (high region, corners)");
+
+    run_test("compact high moves many blocks in the right order", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(320 * cuArena::MB, cuArena::GPUMemoryType::Managed));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        const size_t nfloat = 32 * cuArena::MB / sizeof(float);
+        float* L[8];
+        for (int i = 0; i < 8; i++) L[i] = a.allocate<float>(nfloat);
+        for (int i = 0; i < 8; i += 2) a.deallocate(L[i]);
+
+        const size_t stride = 4096;
+        for (int i = 1; i < 8; i += 2)
+            for (size_t k = 0; k < nfloat; k += stride) L[i][k] = (float)(i * 1000 + (k / stride));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        const size_t used_before = a.gpu_used();
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        const size_t n = a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, nullptr, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        TCHECK(n == 4);
+        TCHECK(a.gpu_used() == used_before);
+
+        bool ok = true;
+        for (int i = 1; i < 8; i += 2) {
+            float* np = moved.count(L[i]) ? static_cast<float*>(moved[L[i]]) : L[i];
+            for (size_t k = 0; k < nfloat; k += stride)
+                if (np[k] != (float)(i * 1000 + (k / stride))) ok = false;
+        }
+        TCHECK(ok);
+        TCHECK(a.gpu_largest_free_block() == a.gpu_available());
+
+        for (int i = 1; i < 8; i += 2) {
+            float* np = moved.count(L[i]) ? static_cast<float*>(moved[L[i]]) : L[i];
+            a.deallocate(np);
+        }
+    });
+
+    // A small hole above a big block means many chunks, not the two a same size pair gives.
+    run_test("compact high copies a block in many chunks", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Managed));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        const size_t nfloat = 128 * cuArena::MB / sizeof(float);
+        float* A = a.allocate<float>(16 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(nfloat);
+        a.deallocate(A);
+
+        const size_t stride = 4096;
+        for (size_t k = 0; k < nfloat; k += stride) B[k] = (float)(k + 7);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, nullptr, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        // 128 MB moving up by 16 MB, with a 112 MB gap, so it goes in 8 chunks.
+        float* nB = static_cast<float*>(moved[B]);
+        TCHECK((size_t)((char*)nB - (char*)B) == 16 * cuArena::MB);
+        bool ok = true;
+        for (size_t k = 0; k < nfloat; k += stride)
+            if (nB[k] != (float)(k + 7)) ok = false;
+        TCHECK(ok);
+        a.deallocate(nB);
+    });
+
+    run_test("compact high on a packed region moves nothing", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Device, stream));
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        const size_t used_before = a.gpu_used();
+        const size_t avail_before = a.gpu_available();
+
+        int fired = 0;
+        const size_t n = a.compact_gpu_dynamic([&](cuArena::addr_t, cuArena::addr_t, size_t) {
+            ++fired;
+        }, stream, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaStreamSynchronize(stream));
+
+        TCHECK(n == 0);
+        TCHECK(fired == 0);
+        TCHECK(a.gpu_used() == used_before);
+        TCHECK(a.gpu_available() == avail_before);
+        a.deallocate(A);
+        a.deallocate(B);
+    });
+
+    run_test("compact high with no large blocks is a no-op", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Device, stream));
+        float* small = a.allocate<float>(8 * cuArena::MB / sizeof(float));
+        const size_t avail_before = a.gpu_available();
+
+        const size_t n = a.compact_gpu_dynamic([&](cuArena::addr_t, cuArena::addr_t, size_t) {},
+                                               stream, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaStreamSynchronize(stream));
+
+        TCHECK(n == 0);
+        TCHECK(a.gpu_available() == avail_before);
+        float* big = a.allocate<float>(200 * cuArena::MB / sizeof(float));
+        TCHECK(big != nullptr);
+        a.deallocate(big);
+        a.deallocate(small);
+    });
+
+    run_test("stable allocs survive compact high", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Managed, nullptr,
+                                 32 * cuArena::MB));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+        int* sp = a.allocate<int>(4, cuArena::Region::Stable);
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        sp[0] = 4242;
+        CUARENA_CHECK(cudaDeviceSynchronize());
+        a.deallocate(A);
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, nullptr, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        TCHECK(moved.find(sp) == moved.end());
+        TCHECK(sp[0] == 4242);
+        TCHECK(a.gpu_stable_used() > 0);
+        float* nB = moved.count(B) ? static_cast<float*>(moved[B]) : B;
+        a.deallocate(nB);
+        a.deallocate(sp);
+    });
+
+    // Both ends have to stay consistent after a pack, so allocate from each and check
+    // the two do not land on top of each other.
+    run_test("both regions still allocate after compact high", [&] {
+        cuArena::DeviceArena a;
+        TCHECK(a.create_gpu_pool(256 * cuArena::MB, cuArena::GPUMemoryType::Managed));
+        CUARENA_CHECK(cudaDeviceSynchronize());
+        float* A = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        float* B = a.allocate<float>(32 * cuArena::MB / sizeof(float));
+        a.deallocate(A);
+
+        std::unordered_map<cuArena::addr_t, cuArena::addr_t> moved;
+        a.compact_gpu_dynamic([&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+            moved[old_p] = new_p;
+        }, nullptr, cuArena::CompactRegion::High);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+        float* nB = moved.count(B) ? static_cast<float*>(moved[B]) : B;
+
+        const size_t nbig = 64 * cuArena::MB / sizeof(float);
+        const size_t nsmall = 8 * cuArena::MB / sizeof(float);
+        float* big = a.allocate<float>(nbig);
+        float* small = a.allocate<float>(nsmall);
+        for (size_t k = 0; k < nbig; k += 4096) big[k] = 1.0f;
+        for (size_t k = 0; k < nsmall; k += 4096) small[k] = 2.0f;
+        CUARENA_CHECK(cudaDeviceSynchronize());
+
+        bool ok = true;
+        for (size_t k = 0; k < nbig; k += 4096) if (big[k] != 1.0f) ok = false;
+        for (size_t k = 0; k < nsmall; k += 4096) if (small[k] != 2.0f) ok = false;
+        TCHECK(ok);
+
+        // And a low pack still works with large blocks live.
+        a.compact_gpu_dynamic([&](cuArena::addr_t, cuArena::addr_t, size_t) {},
+                              nullptr, cuArena::CompactRegion::Low);
+        CUARENA_CHECK(cudaDeviceSynchronize());
+        for (size_t k = 0; k < nbig; k += 4096) if (big[k] != 1.0f) ok = false;
+        TCHECK(ok);
+
+        a.deallocate(big);
+        a.deallocate(nB);
     });
 }
 
@@ -870,6 +1050,7 @@ int main() {
     test_dynamic_bins(stream);
     test_compact(stream);
     test_compact_high(stream);
+    test_compact_high_corners(stream);
     test_mixed_stable_dynamic(stream);
 
     CUARENA_CHECK(cudaStreamDestroy(stream));
