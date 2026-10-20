@@ -46,9 +46,9 @@ The design is suited for SYCL applications that perform many repeated allocation
 ## Build
 
 ```bash
-git clone https://github.com/muhos/syclArena.git
+git clone https://github.com/stastez/syclArena.git
 cd syclArena
-cmake -B build -DCMAKE_CXX_COMPILER=acpp -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
@@ -152,11 +152,14 @@ using RelocateCallback = std::function<void(addr_t old_ptr, addr_t new_ptr, size
 ### Pool lifecycle
 
 ```cpp
-// Construct and create both pools immediately
+// Construct and create both pools immediately.
+// bypass = true: no pools are created; allocate/deallocate pass
+// straight through to SYCL USM (see "Bypass mode" below).
 DeviceArena(size_t cpu_limit, size_t gpu_limit,
             GPUMemoryType gtype  = GPUMemoryType::Device,
             CPUMemoryType ctype  = CPUMemoryType::Pinned,
-            sycl::queue*  queue  = nullptr);
+            sycl::queue*  queue  = nullptr,
+            bool          bypass = false);
 
 // Create pools manually (limit = 0 uses all available memory minus a safety margin)
 // stable_bytes: size of the stable region at the front of the GPU pool (0 = no stable region)
@@ -206,6 +209,25 @@ template<class T> T*   allocate_pinned  (size_t count);
 template<class T> void deallocate_pinned(T* ptr);
 template<class T> void resize_pinned    (T*& ptr, size_t new_count);
 ```
+
+### Bypass mode
+
+```cpp
+syclArena::DeviceArena alloc(128 * syclArena::MB, 256 * syclArena::MB,
+                             syclArena::GPUMemoryType::Device,
+                             syclArena::CPUMemoryType::Pinned, &stream,
+                             /*bypass=*/true);
+```
+
+With `bypass = true` the arena makes no pool allocation at construction and all arena functionality is off:
+
+- `allocate`/`deallocate` pass straight through to `sycl::malloc_device`/`sycl::malloc_shared` (selected by `GPUMemoryType`) and `sycl::free`
+- `allocate_pinned`/`deallocate_pinned` pass through to `sycl::malloc_host` and `sycl::free` (`std::malloc`/`std::free` for `CPUMemoryType::Pageable`)
+- `resize`/`resize_pinned` free the old buffer and allocate a new one
+- the `Region::Stable` argument is ignored
+- pool lifecycle methods (`create_*_pool`, `resize_*_pool`) are rejected, `compact_gpu_dynamic()` is a no-op, and the stats queries report zero
+
+Use it to keep the syclArena allocator interface while deferring all allocation to the SYCL runtime.
 
 ### Stats
 

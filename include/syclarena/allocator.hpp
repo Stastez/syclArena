@@ -87,6 +87,7 @@ namespace syclArena {
         sycl::queue* _gqueue = nullptr;
         GPUMemoryType _gtype = GPUMemoryType::Device;
         CPUMemoryType _ctype = CPUMemoryType::Pinned;
+        bool          _bypass = false;    // bypass mode: no pools, pass through to SYCL USM
 
         mutable std::mutex _mutex;
 
@@ -153,6 +154,12 @@ namespace syclArena {
         void   _stable_free_block  (const addr_t& ptr);
         void   _cpu_free_block     (const addr_t& ptr);
 
+        // Bypass mode: no pools; allocations go straight to SYCL USM / std allocators.
+        addr_t _bypass_gpu_alloc  (const size_t& aligned_bytes);
+        void   _bypass_gpu_free   (const addr_t& ptr);
+        addr_t _bypass_cpu_alloc  (const size_t& aligned_bytes);
+        void   _bypass_cpu_free   (const addr_t& ptr);
+
     public:
 
         DeviceArena           () = default;
@@ -160,7 +167,8 @@ namespace syclArena {
                                const size_t& gpu_limit,
                                const GPUMemoryType& gtype = GPUMemoryType::Device,
                                const CPUMemoryType& ctype = CPUMemoryType::Pinned,
-                               sycl::queue* queue = nullptr);
+                               sycl::queue* queue = nullptr,
+                               const bool& bypass = false);
         DeviceArena           (const DeviceArena&) = delete;
         DeviceArena& operator=(const DeviceArena&) = delete;
         DeviceArena           (DeviceArena&&)      = delete;
@@ -194,6 +202,7 @@ namespace syclArena {
             if (!count) return nullptr;
             const size_t aligned = align_up(count * sizeof(T));
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) return static_cast<T*>(_bypass_gpu_alloc(aligned));
             if (region == Region::Stable) {
                 if (_stable_size == 0) {
                     Logger::debug("syclArena: pool has no stable region — falling back to dynamic");
@@ -208,6 +217,7 @@ namespace syclArena {
         void deallocate(T* ptr) {
             if (!ptr) return;
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) { _bypass_gpu_free(static_cast<addr_t>(ptr)); return; }
             addr_t p = static_cast<addr_t>(ptr);
             if (_stable_size > 0) {
                 byte_t* stable_end = static_cast<byte_t*>(_gpool.mem) + _stable_size;
@@ -229,6 +239,11 @@ namespace syclArena {
             }
             const size_t aligned = align_up(new_count * sizeof(T));
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) {
+                if (ptr) _bypass_gpu_free(static_cast<addr_t>(ptr));
+                ptr = static_cast<T*>(_bypass_gpu_alloc(aligned));
+                return;
+            }
             if (ptr) {
                 addr_t p = static_cast<addr_t>(ptr);
                 // Resizing a stable allocation is not permitted
@@ -266,6 +281,7 @@ namespace syclArena {
             if (!count) return nullptr;
             const size_t aligned = align_up(count * sizeof(T));
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) return static_cast<T*>(_bypass_cpu_alloc(aligned));
             return static_cast<T*>(_cpu_alloc(aligned));
         }
 
@@ -273,6 +289,7 @@ namespace syclArena {
         void deallocate_pinned(T* ptr) {
             if (!ptr) return;
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) { _bypass_cpu_free(static_cast<addr_t>(ptr)); return; }
             _cpu_free_block(static_cast<addr_t>(ptr));
         }
 
@@ -285,6 +302,11 @@ namespace syclArena {
             }
             const size_t aligned = align_up(new_count * sizeof(T));
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_bypass) {
+                if (ptr) _bypass_cpu_free(static_cast<addr_t>(ptr));
+                ptr = static_cast<T*>(_bypass_cpu_alloc(aligned));
+                return;
+            }
             if (ptr) {
                 auto it = _cpu_alloc_list.find(static_cast<addr_t>(ptr));
                 if (it == _cpu_alloc_list.end()) {

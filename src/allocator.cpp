@@ -6,7 +6,16 @@ namespace syclArena {
                              const size_t& gpu_limit,
                              const GPUMemoryType& gtype,
                              const CPUMemoryType& ctype,
-                             sycl::queue* queue) {
+                             sycl::queue* queue,
+                             const bool& bypass) {
+        _gtype  = gtype;
+        _ctype  = ctype;
+        _gqueue = queue;
+        _bypass = bypass;
+        if (_bypass) {
+            Logger::info("syclArena: bypass mode — pools disabled, allocate/deallocate pass through to SYCL USM");
+            return;
+        }
         if (!create_cpu_pool(cpu_limit, ctype)) {
             std::string type = (ctype == CPUMemoryType::Pinned) ? "pinned" : "pageable";
             std::string msg = "failed to create CPU " + type + " pool";
@@ -24,10 +33,65 @@ namespace syclArena {
         destroy_cpu_pool();
     }
 
+    addr_t DeviceArena::_bypass_gpu_alloc(const size_t& aligned_bytes) {
+        assert(is_aligned(aligned_bytes));
+        try {
+            return (_gtype == GPUMemoryType::Managed)
+                ? sycl::malloc_shared (aligned_bytes, resolve_queue(_gqueue))
+                : sycl::malloc_device (aligned_bytes, resolve_queue(_gqueue));
+        }
+        catch (const std::bad_alloc& e) {
+            Logger::error("syclArena: bypass GPU allocate failed: %s", e.what());
+            throw gpu_memory_error(e.what());
+        }
+        catch (const sycl::exception& e) {
+            Logger::error("syclArena: bypass GPU allocate failed: %s", e.what());
+            throw gpu_memory_error(e.what());
+        }
+    }
+
+    void DeviceArena::_bypass_gpu_free(const addr_t& ptr) {
+        SYCLARENA_CHECK(sycl::free(ptr, resolve_queue(_gqueue)));
+    }
+
+    addr_t DeviceArena::_bypass_cpu_alloc(const size_t& aligned_bytes) {
+        assert(is_aligned(aligned_bytes));
+        if (_ctype == CPUMemoryType::Pageable) {
+            addr_t p = std::malloc(aligned_bytes);
+            if (!p) {
+                Logger::error("syclArena: bypass pageable allocate failed: out of memory");
+                throw cpu_memory_error("bypass pageable allocate failed: out of memory");
+            }
+            return p;
+        }
+        try {
+            return sycl::malloc_host(aligned_bytes, resolve_queue(nullptr));
+        }
+        catch (const std::bad_alloc& e) {
+            Logger::error("syclArena: bypass pinned allocate failed: %s", e.what());
+            throw cpu_memory_error(e.what());
+        }
+        catch (const sycl::exception& e) {
+            Logger::error("syclArena: bypass pinned allocate failed: %s", e.what());
+            throw cpu_memory_error(e.what());
+        }
+    }
+
+    void DeviceArena::_bypass_cpu_free(const addr_t& ptr) {
+        if (_ctype == CPUMemoryType::Pageable)
+            std::free(ptr);
+        else
+            SYCLARENA_CHECK(sycl::free(ptr, resolve_queue(nullptr)));
+    }
+
     bool DeviceArena::create_gpu_pool(const size_t& limit,
                                       const GPUMemoryType& type,
                                       sycl::queue* queue,
                                       const size_t& stable_bytes) {
+        if (_bypass) {
+            Logger::warn("syclArena: bypass mode — GPU pool creation is disabled");
+            return false;
+        }
         if (_gpool.mem) {
             Logger::info("GPU pool already exists (%zu MB)", _gpool.size / MB);
             return true;
@@ -241,6 +305,10 @@ namespace syclArena {
         if (_cpool.mem) {
             Logger::info("CPU pool already exists (%zu MB)", _cpool.size / MB);
             return true;
+        }
+        if (_bypass) {
+            Logger::warn("syclArena: bypass mode — CPU pool creation is disabled");
+            return false;
         }
         sys_mem_info(_cfree_mem, _ctot);
         if (_cfree_mem > CPU_PENALTY) _cfree_mem -= CPU_PENALTY;
