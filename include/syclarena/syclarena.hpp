@@ -5,5 +5,5 @@
 #include "logger.hpp"
 #include "sysinfo.hpp"
 #include "constants.hpp"
-#include "allocator.cuh"
-#include "definitions.cuh"
+#include "allocator.hpp"
+#include "definitions.hpp"

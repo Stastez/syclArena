@@ -1,18 +1,18 @@
-#include <cuarena/allocator.cuh>
+#include <syclarena/allocator.hpp>
 
-namespace cuArena {
+namespace syclArena {
 
     DeviceArena::DeviceArena(const size_t& cpu_limit,
                              const size_t& gpu_limit,
                              const GPUMemoryType& gtype,
                              const CPUMemoryType& ctype,
-                             const cudaStream_t& stream) {
+                             sycl::queue* queue) {
         if (!create_cpu_pool(cpu_limit, ctype)) {
             std::string type = (ctype == CPUMemoryType::Pinned) ? "pinned" : "pageable";
             std::string msg = "failed to create CPU " + type + " pool";
             throw cpu_memory_error(msg.c_str());
         }
-        if (!create_gpu_pool(gpu_limit, gtype, stream)) {
+        if (!create_gpu_pool(gpu_limit, gtype, queue)) {
             std::string type = (gtype == GPUMemoryType::Device) ? "device" : "managed";
             std::string msg = "failed to create GPU " + type + " pool";
             throw gpu_memory_error(msg.c_str());
@@ -26,13 +26,13 @@ namespace cuArena {
 
     bool DeviceArena::create_gpu_pool(const size_t& limit,
                                       const GPUMemoryType& type,
-                                      const cudaStream_t& stream,
+                                      sycl::queue* queue,
                                       const size_t& stable_bytes) {
         if (_gpool.mem) {
             Logger::info("GPU pool already exists (%zu MB)", _gpool.size / MB);
             return true;
         }
-        cudaMemGetInfo(&_gfree_mem, &_gtot);
+        gpu_mem_info(resolve_queue(queue).get_device(), _gfree_mem, _gtot);
         if (_gfree_mem > GPU_PENALTY) _gfree_mem -= GPU_PENALTY;
         _glimit = limit ? align_up(limit) : 0;
         if (_glimit) {
@@ -71,7 +71,7 @@ namespace cuArena {
         // Read once, not per allocation. Changing it mid run would put blocks of one
         // size class in both regions.
         _large_min = LARGE_MIN;
-        if (const char* e = std::getenv("CUARENA_LARGE_MIN_MB")) {
+        if (const char* e = std::getenv("SYCLARENA_LARGE_MIN_MB")) {
             const long long v = std::atoll(e);
             if (v >= 0) _large_min = (size_t)v * MB;
         }
@@ -83,22 +83,29 @@ namespace cuArena {
         _gpu_hi_serves = 0;
         _gpool.cap = _gpu_hi - _gpool.off;   // the gap between the two ends
         _gtype   = type;
-        _gstream = stream;
+        _gqueue  = queue;
 
         if (type == GPUMemoryType::Managed) {
-            if (stream) Logger::warn("GPU pool: stream argument ignored for Managed memory");
-            if (cudaMallocManaged(reinterpret_cast<void**>(&_gpool.mem), _gpool.size) != cudaSuccess) {
+            try {
+                _gpool.mem = sycl::malloc_shared(_gpool.size, resolve_queue(queue));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _gpool = Pool{};
                 return false;
             }
-            CUARENA_CHECK(cudaMemset(_gpool.mem, 0, _gpool.size));
+            SYCLARENA_CHECK(resolve_queue(queue).memset(_gpool.mem, 0, _gpool.size).wait_and_throw());
         }
         else {
-            if (CUARENA_MALLOC(reinterpret_cast<void**>(&_gpool.mem), _gpool.size, stream) != cudaSuccess) {
+            try {
+                _gpool.mem = sycl::malloc_device(_gpool.size, resolve_queue(queue));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _gpool = Pool{};
                 return false;
             }
-            CUARENA_CHECK(cudaMemsetAsync(_gpool.mem, 0, _gpool.size, stream));
+            SYCLARENA_CHECK(resolve_queue(queue).memset(_gpool.mem, 0, _gpool.size));
         }
 
         Logger::info("GPU %s pool created: %zu MB (stable: %zu MB, dynamic: %zu MB)",
@@ -127,20 +134,20 @@ namespace cuArena {
             _stable_size  = 0;
             _stable_bytes = 0;
         }
-        CUARENA_CHECK(CUARENA_FREE(_gpool.mem, _gstream));
-        CUARENA_CHECK(cudaStreamSynchronize(_gstream));
+        SYCLARENA_CHECK(sycl::free(_gpool.mem, resolve_queue(_gqueue)));
+        SYCLARENA_SYNC(_gqueue);
         _gpool = Pool{};
         Logger::info("GPU %s pool destroyed",
             _gtype == GPUMemoryType::Device ? "device" : "managed");
         return true;
     }
 
-    bool DeviceArena::resize_gpu_pool(const size_t& new_size, cudaStream_t stream) {
+    bool DeviceArena::resize_gpu_pool(const size_t& new_size, sycl::queue* queue) {
         if (!_gpool.mem) {
             Logger::warn("GPU pool: resize called but pool not yet created");
             return false;
         }
-        cudaMemGetInfo(&_gfree_mem, &_gtot);
+        gpu_mem_info(resolve_queue(queue).get_device(), _gfree_mem, _gtot);
         if (new_size > _gfree_mem) {
             Logger::warn("Resizing GPU pool: %zu MB requested but only %zu MB free",
                          new_size / MB, _gfree_mem / MB);
@@ -158,8 +165,8 @@ namespace cuArena {
             _gpu_stable_free_by_addr.clear();
             _gpu_stable_alloc_list.clear();
             _gpu_stable_allocated = 0;
-            CUARENA_FREE(_gpool.mem, _gstream);
-            cudaStreamSynchronize(_gstream);
+            SYCLARENA_CHECK(sycl::free(_gpool.mem, resolve_queue(_gqueue)));
+            SYCLARENA_SYNC(_gqueue);
             _gpool = Pool{};
         }
         const size_t aligned = align_up(new_size);
@@ -180,22 +187,29 @@ namespace cuArena {
         _gpu_hi      = aligned;
         _gpool.cap   = _gpu_hi - _gpool.off;
         _glimit      = aligned;
-        _gstream     = stream;
+        _gqueue      = queue;
 
         if (_gtype == GPUMemoryType::Managed) {
-            if (stream) Logger::warn("Resizing GPU pool: stream argument ignored for Managed memory");
-            if (cudaMallocManaged(reinterpret_cast<void**>(&_gpool.mem), _gpool.size) != cudaSuccess) {
+            try {
+                _gpool.mem = sycl::malloc_shared(_gpool.size, resolve_queue(queue));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _gpool = Pool{};
                 return false;
             }
-            CUARENA_CHECK(cudaMemset(_gpool.mem, 0, _gpool.size));
+            SYCLARENA_CHECK(resolve_queue(queue).memset(_gpool.mem, 0, _gpool.size).wait_and_throw());
         }
         else {
-            if (CUARENA_MALLOC(reinterpret_cast<void**>(&_gpool.mem), _gpool.size, stream) != cudaSuccess) {
+            try {
+                _gpool.mem = sycl::malloc_device(_gpool.size, resolve_queue(queue));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _gpool = Pool{};
                 return false;
             }
-            CUARENA_CHECK(cudaMemsetAsync(_gpool.mem, 0, _gpool.size, stream));
+            SYCLARENA_CHECK(resolve_queue(queue).memset(_gpool.mem, 0, _gpool.size));
         }
         Logger::info("GPU %s pool resized to %zu MB",
             _gtype == GPUMemoryType::Device ? "device" : "managed",
@@ -254,7 +268,11 @@ namespace cuArena {
             std::memset(_cpool.mem, 0, _cpool.size);
         }
         else {
-            if (cudaMallocHost(&_cpool.mem, _cpool.size) != cudaSuccess) {
+            try {
+                _cpool.mem = sycl::malloc_host(_cpool.size, resolve_queue(nullptr));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _cpool = Pool{};
                 return false;
             }
@@ -277,7 +295,7 @@ namespace cuArena {
         if (_ctype == CPUMemoryType::Pageable)
             std::free(_cpool.mem);
         else
-            if (cudaFreeHost(_cpool.mem) != cudaSuccess) return false;
+            SYCLARENA_CHECK(sycl::free(_cpool.mem, resolve_queue(nullptr)));
         _cpool = Pool{};
         Logger::info("CPU %s pool destroyed",
             _ctype == CPUMemoryType::Pinned ? "pinned" : "pageable");
@@ -303,7 +321,7 @@ namespace cuArena {
             if (_ctype == CPUMemoryType::Pageable)
                 std::free(_cpool.mem);
             else
-                cudaFreeHost(_cpool.mem);
+                SYCLARENA_CHECK(sycl::free(_cpool.mem, resolve_queue(nullptr)));
             _cpool = Pool{};
         }
         const size_t aligned = align_up(new_size);
@@ -315,7 +333,11 @@ namespace cuArena {
             std::memset(_cpool.mem, 0, _cpool.size);
         }
         else {
-            if (cudaMallocHost(&_cpool.mem, _cpool.size) != cudaSuccess) {
+            try {
+                _cpool.mem = sycl::malloc_host(_cpool.size, resolve_queue(nullptr));
+            }
+            catch (const sycl::exception& e) {
+                Logger::error("SYCL error [%s:%d]: %s", __FILE__, __LINE__, e.what());
                 _cpool = Pool{};
                 return false;
             }
@@ -367,7 +389,7 @@ namespace cuArena {
 
     addr_t DeviceArena::_pop_gpu_free(const size_t& size, size_t& out_size) {
         int k = _bin_index(size);
-        
+
         // search bin k for a block large enough to satisfy the request
         {
             auto& bin = _gpu_bins[k];
@@ -386,7 +408,7 @@ namespace cuArena {
                         _gpu_free_by_addr.emplace(rem, rsz);
                         _gpu_bins[_bin_index(rsz)].insert(rem);
                         out_size = size;
-                    } 
+                    }
                     else {
                         out_size = block_size;
                     }
@@ -412,7 +434,7 @@ namespace cuArena {
                 _gpu_free_by_addr.emplace(rem, rsz);
                 _gpu_bins[_bin_index(rsz)].insert(rem);
                 out_size = size;
-            } 
+            }
             else {
                 out_size = block_size;
             }
@@ -443,7 +465,7 @@ namespace cuArena {
                 std::to_string(aligned_bytes / MB) + " MB, bump tail " +
                 std::to_string(_gpool.cap / MB) + " MB, largest free block " +
                 std::to_string(largest_free / MB) + " MB)";
-            Logger::debug("cuArena: %s", msg.c_str());
+            Logger::debug("syclArena: %s", msg.c_str());
             throw gpu_memory_error(msg.c_str());
         }
         ptr = static_cast<byte_t*>(_gpool.mem) + _gpool.off;
@@ -477,7 +499,7 @@ namespace cuArena {
         }
 
         if (_gpu_hi < _gpool.off + aligned_bytes) {
-            Logger::debug("cuArena: GPU pool out of memory (high region: gap %zu MB, requested %zu MB)",
+            Logger::debug("syclArena: GPU pool out of memory (high region: gap %zu MB, requested %zu MB)",
                           (_gpu_hi - _gpool.off) / MB, aligned_bytes / MB);
             const std::string msg = "GPU pool out of memory (requested " +
                 std::to_string(aligned_bytes / MB) + " MB large-region, shared gap " +
@@ -499,7 +521,7 @@ namespace cuArena {
     void DeviceArena::_insert_gpu_hi_free(const addr_t& ptr, const size_t& size) {
         auto [it, ok] = _gpu_hi_free_by_addr.emplace(ptr, size);
         if (!ok) {
-            Logger::debug("cuArena: double free in high region %p", ptr);
+            Logger::debug("syclArena: double free in high region %p", ptr);
             throw gpu_memory_error("double free in the large-block region");
         }
         auto next = std::next(it);
@@ -575,9 +597,9 @@ namespace cuArena {
 
         // Stable region allocator
         if (aligned_bytes > _stable_cap) {
-            Logger::debug("cuArena: stable GPU region out of memory (%zu MB remaining, requested %zu MB)",
+            Logger::debug("syclArena: stable GPU region out of memory (%zu MB remaining, requested %zu MB)",
                          _stable_cap / MB, aligned_bytes / MB);
-            throw gpu_memory_error("cuArena: stable GPU region out of memory");
+            throw gpu_memory_error("syclArena: stable GPU region out of memory");
         }
         addr_t ptr = static_cast<byte_t*>(_gpool.mem) + _stable_off;
         _stable_off += aligned_bytes;
@@ -717,40 +739,41 @@ namespace cuArena {
         _sync_gap();
     }
 
-    // cudaMemcpy is undefined where source and destination overlap, which happens when a
-    // block moves by less than its own size. Route those through the bounce buffer, or
-    // copy in disjoint chunks of delta. Ascending moving down, descending moving up, so
-    // each chunk is read before anything overwrites it.
+    // queue::memcpy is undefined where source and destination overlap, which happens
+    // when a block moves by less than its own size. Route those through the bounce
+    // buffer, or copy in disjoint chunks of delta. Ascending moving down, descending
+    // moving up, so each chunk is read before anything overwrites it.
     void DeviceArena::_move_block(byte_t* dst, byte_t* src, size_t sz, byte_t* bounce,
-                                  size_t bounce_size, cudaStream_t stream) {
+                                  size_t bounce_size, sycl::queue* queue) {
         if (dst == src) return;
 
+        sycl::queue& q = resolve_queue(queue);
         const size_t delta = (dst < src) ? (size_t)(src - dst) : (size_t)(dst - src);
         if (delta >= sz) {
-            CUARENA_CHECK(cudaMemcpyAsync(dst, src, sz, cudaMemcpyDeviceToDevice, stream));
+            SYCLARENA_CHECK(q.memcpy(dst, src, sz));
             return;
         }
         if (bounce_size >= sz) {
-            CUARENA_CHECK(cudaMemcpyAsync(bounce, src, sz, cudaMemcpyDeviceToDevice, stream));
-            CUARENA_CHECK(cudaMemcpyAsync(dst, bounce, sz, cudaMemcpyDeviceToDevice, stream));
+            SYCLARENA_CHECK(q.memcpy(bounce, src, sz));
+            SYCLARENA_CHECK(q.memcpy(dst, bounce, sz));
             return;
         }
         if (dst < src) {
             for (size_t off = 0; off < sz; off += delta) {
                 const size_t len = (sz - off < delta) ? (sz - off) : delta;
-                CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
+                SYCLARENA_CHECK(q.memcpy(dst + off, src + off, len));
             }
         }
         else {
             for (size_t off = sz; off > 0; ) {
                 const size_t len = (off < delta) ? off : delta;
                 off -= len;
-                CUARENA_CHECK(cudaMemcpyAsync(dst + off, src + off, len, cudaMemcpyDeviceToDevice, stream));
+                SYCLARENA_CHECK(q.memcpy(dst + off, src + off, len));
             }
         }
     }
 
-    size_t DeviceArena::compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream,
+    size_t DeviceArena::compact_gpu_dynamic(RelocateCallback callback, sycl::queue* queue,
                                             CompactRegion which) {
         std::vector<std::pair<addr_t, size_t>> active_blocks;  // in move order
         std::vector<addr_t>                    new_ptrs;
@@ -759,12 +782,12 @@ namespace cuArena {
         {
             std::lock_guard<std::mutex> lock(_mutex);
             if (which == CompactRegion::High) _plan_compact_high(active_blocks, new_ptrs, bounce, bounce_size);
-            else                              _plan_compact_low(active_blocks, new_ptrs, bounce, bounce_size);
+            else                              _plan_compact_low (active_blocks, new_ptrs, bounce, bounce_size);
         }
 
         for (size_t i = 0; i < active_blocks.size(); ++i) {
             _move_block(static_cast<byte_t*>(new_ptrs[i]), static_cast<byte_t*>(active_blocks[i].first),
-                        active_blocks[i].second, bounce, bounce_size, stream);
+                        active_blocks[i].second, bounce, bounce_size, queue);
         }
 
         size_t moved = 0;

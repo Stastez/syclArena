@@ -14,16 +14,16 @@
 #include "logger.hpp"
 #include "sysinfo.hpp"
 #include "constants.hpp"
-#include "definitions.cuh"
+#include "definitions.hpp"
 
-namespace cuArena {
+namespace syclArena {
 
     /**
-     * Called by compact_gpu_dynamic for each relocated dynamic allocation.  
+     * Called by compact_gpu_dynamic for each relocated dynamic allocation.
      * Input: (old_ptr, new_ptr, byte_size).
-     * The callback runs after all cudaMemcpyAsync calls have been queued
-     * on the provided stream; the caller must sync that stream before
-     * accessing GPU data through the new pointers.
+     * The callback runs after all copies have been queued on the provided
+     * queue; the caller must wait on that queue before accessing GPU data
+     * through the new pointers.
      */
     using RelocateCallback = std::function<void(addr_t, addr_t, size_t)>;
 
@@ -60,7 +60,7 @@ namespace cuArena {
         // from the pool end; smaller ones grow up from the bottom. Keeping the large
         // blocks at one end stops small allocations stranding the contiguous space a
         // large request needs. Nothing is relocated, so no caller pointer changes.
-        // Override at pool creation with CUARENA_LARGE_MIN_MB.
+        // Override at pool creation with SYCLARENA_LARGE_MIN_MB.
         static constexpr size_t LARGE_MIN   = 16 * MB;
         static constexpr size_t GPU_PENALTY = 256 * MB;
         static constexpr size_t CPU_PENALTY = 512 * MB;
@@ -78,13 +78,13 @@ namespace cuArena {
          * so the first entry is taken immediately.
          */
         static constexpr int NUM_BINS = 32;
-    
+
         Pool   _gpool, _cpool;
         size_t _gtot = 0, _gfree_mem = 0, _glimit = 0;
         size_t _ctot = 0, _cfree_mem = 0, _climit = 0;
         size_t _gpu_allocated = 0, _cpu_allocated = 0;
         size_t _gpu_peak = 0;
-        cudaStream_t  _gstream = 0;
+        sycl::queue* _gqueue = nullptr;
         GPUMemoryType _gtype = GPUMemoryType::Device;
         CPUMemoryType _ctype = CPUMemoryType::Pinned;
 
@@ -100,7 +100,7 @@ namespace cuArena {
         std::map<addr_t, size_t>           _gpu_stable_free_by_addr;
         std::unordered_map<addr_t, size_t> _gpu_stable_alloc_list;
 
-        // Dynamic sub-region (rest of GPU pool). 
+        // Dynamic sub-region (rest of GPU pool).
         // Uses isolated bins + coalescing + compact().
         std::map<addr_t, size_t>                _gpu_free_by_addr;   // coalescing
         std::array<std::set<addr_t>, NUM_BINS>  _gpu_bins;           // size index
@@ -113,7 +113,7 @@ namespace cuArena {
         std::map<addr_t, size_t>           _gpu_hi_free_by_addr;
         std::unordered_map<addr_t, size_t> _gpu_hi_alloc_list;
         size_t                             _gpu_hi_allocated = 0;
-        size_t                             _gpu_hi_serves = 0;      // large requests served, ever
+        size_t                             _gpu_hi_serves = 0;       // large requests served, ever
 
         std::map<addr_t, size_t>           _cpu_free_by_addr;
         std::map<size_t, std::set<addr_t>> _cpu_free_by_size;
@@ -143,7 +143,7 @@ namespace cuArena {
                                     byte_t*& bounce, size_t& bounce_size);
         // Moves one block with memmove semantics, in either direction.
         void   _move_block         (byte_t* dst, byte_t* src, size_t sz, byte_t* bounce,
-                                    size_t bounce_size, cudaStream_t stream);
+                                    size_t bounce_size, sycl::queue* queue);
         void   _insert_gpu_hi_free (const addr_t& ptr, const size_t& size);
         void   _gpu_hi_free_block  (const addr_t& ptr);
         void   _sync_gap           () noexcept { _gpool.cap = _gpu_hi - _gpool.off; }
@@ -160,8 +160,7 @@ namespace cuArena {
                                const size_t& gpu_limit,
                                const GPUMemoryType& gtype = GPUMemoryType::Device,
                                const CPUMemoryType& ctype = CPUMemoryType::Pinned,
-                               const cudaStream_t& stream = 0);
-
+                               sycl::queue* queue = nullptr);
         DeviceArena           (const DeviceArena&) = delete;
         DeviceArena& operator=(const DeviceArena&) = delete;
         DeviceArena           (DeviceArena&&)      = delete;
@@ -171,13 +170,13 @@ namespace cuArena {
 
         bool create_gpu_pool    (const size_t& limit = 0,
                                  const GPUMemoryType& gtype = GPUMemoryType::Device,
-                                 const cudaStream_t& stream = 0,
+                                 sycl::queue* queue = nullptr,
                                  const size_t& stable_bytes = 0);
         bool create_cpu_pool    (const size_t& limit = 0,
                                  const CPUMemoryType& ctype = CPUMemoryType::Pinned);
         bool destroy_gpu_pool   ();
         bool destroy_cpu_pool   ();
-        bool resize_gpu_pool    (const size_t& new_size, cudaStream_t stream = 0);
+        bool resize_gpu_pool    (const size_t& new_size, sycl::queue* queue = nullptr);
         bool resize_cpu_pool    (const size_t& new_size);
         void reset_gpu_pool     ();
         void reset_cpu_pool     ();
@@ -197,7 +196,7 @@ namespace cuArena {
             std::lock_guard<std::mutex> lock(_mutex);
             if (region == Region::Stable) {
                 if (_stable_size == 0) {
-                    Logger::debug("cuArena: pool has no stable region — falling back to dynamic");
+                    Logger::debug("syclArena: pool has no stable region — falling back to dynamic");
                     return static_cast<T*>(_gpu_alloc(aligned));
                 }
                 return static_cast<T*>(_stable_alloc(aligned));
@@ -236,18 +235,28 @@ namespace cuArena {
                 if (_stable_size > 0) {
                     byte_t* stable_end = static_cast<byte_t*>(_gpool.mem) + _stable_size;
                     if (p >= _gpool.mem && static_cast<byte_t*>(p) < stable_end) {
-                        Logger::debug("cuArena: resize called on a stable-region pointer %p", p);
+                        Logger::debug("syclArena: resize called on a stable-region pointer %p", p);
                         throw gpu_memory_error("cannot resize a stable region allocation");
                     }
                 }
                 auto it = _gpu_alloc_list.find(p);
-                if (it == _gpu_alloc_list.end()) {
-                    Logger::debug("resize: pointer %p not in GPU alloc list", p);
-                    throw gpu_memory_error("invalid pointer");
+                if (it != _gpu_alloc_list.end()) {
+                    if (it->second >= aligned) return;
+                    _gpu_free_block(p);
+                    ptr = nullptr;
                 }
-                if (it->second >= aligned) return;
-                _gpu_free_block(p);
-                ptr = nullptr;
+                else {
+                    // A previous resize may have crossed LARGE_MIN, moving the
+                    // block into the high (large-block) region.
+                    auto hi = _gpu_hi_alloc_list.find(p);
+                    if (hi == _gpu_hi_alloc_list.end()) {
+                        Logger::debug("resize: pointer %p not in GPU alloc list", p);
+                        throw gpu_memory_error("invalid pointer");
+                    }
+                    if (hi->second >= aligned) return;
+                    _gpu_hi_free_block(p);
+                    ptr = nullptr;
+                }
             }
             ptr = static_cast<T*>(_gpu_alloc(aligned));
         }
@@ -295,9 +304,9 @@ namespace cuArena {
          * Packs one end of the dynamic pool, closing that region's holes: Low (the
          * default) slides the small blocks to the front, High slides the large blocks
          * to the pool end so their holes merge into the shared gap. Returns the number
-         * of blocks relocated; sync `stream` before using the new pointers.
+         * of blocks relocated; wait on `queue` before using the new pointers.
          */
-        size_t compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream = 0,
+        size_t compact_gpu_dynamic(RelocateCallback callback, sycl::queue* queue = nullptr,
                                    CompactRegion which = CompactRegion::Low);
 
         addr_t gpu_base             () const noexcept { return _gpool.mem; }
@@ -347,7 +356,7 @@ namespace cuArena {
             return _gpool.cap + freed;                   // cap is the gap between the ends
         }
 
-        // Same as gpu_available() when unfragmented, 
+        // Same as gpu_available() when unfragmented,
         // but much smaller when fragmented.
         size_t gpu_largest_free_block() const noexcept {
             std::lock_guard<std::mutex> lock(_mutex);

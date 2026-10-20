@@ -1,6 +1,6 @@
-#include <cuarena/sysinfo.hpp>
+#include <syclarena/sysinfo.hpp>
 
-namespace cuArena {
+namespace syclArena {
 
     size_t sys_mem_used() {
         size_t used = 0;

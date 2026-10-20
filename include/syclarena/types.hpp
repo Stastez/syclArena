@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace cuArena {
+namespace syclArena {
 
     using addr_t  = void*;
     using byte_t  = unsigned char;

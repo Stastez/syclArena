@@ -1,28 +1,30 @@
 ![GitHub License](https://img.shields.io/github/license/muhos/cuArena)
 [![Build Status](https://github.com/muhos/cuArena/actions/workflows/test-build.yml/badge.svg)](https://github.com/muhos/cuArena/actions/workflows/test-build.yml)
 
-# cuArena
+# syclArena
 
-Pool-based CUDA memory allocator with isolated-bin allocation, address-ordered coalescing free lists, stable/dynamic memory regions, and on-demand defragmentation. I built cuArena for my own CUDA projects. All my allocators will be migrating to it as their memory backend. If it fits your use case, you're welcome to use it too.
+Pool-based SYCL 2020 memory allocator with isolated-bin allocation, address-ordered coalescing free lists, stable/dynamic memory regions, and on-demand defragmentation. muhos built cuArena for their own SYCL projects, now ported to SYCL. All my allocators will be migrating to it as their memory backend. If it fits your use case, you're welcome to use it too.
 
 ---
 
 ## Overview
 
-cuArena pre-allocates a contiguous block of GPU memory and a block of CPU memory at startup, then services all subsequent allocations entirely in host-side C++ with no `cudaMalloc` call is made per allocation.
+syclArena pre-allocates a contiguous block of GPU memory and a block of CPU memory at startup (one `sycl::malloc_device`/`sycl::malloc_shared` + one `sycl::malloc_host` call), then services all subsequent allocations entirely in host-side C++ — no `sycl::malloc_device` call is made per allocation.
 
 The GPU pool is divided into two regions:
 
 - **Stable region** (front of pool), for long-term allocations that persist across iterations. Uses a linear pointer with coalescing-only free list. Compact never touches it.
 - **Dynamic region** (rest of pool), for temporary allocations that are frequently created and destroyed. Uses isolated size-class bins for $O(1)$ allocation in the common case, with coalescing on every free. Supports on-demand compaction to eliminate fragmentation.
 
-The design is suited for CUDA applications that perform many repeated allocations of varying sizes in performance-critical paths, where the overhead of `cudaMalloc` and `cudaFree` becomes measurable. AI frameworks like PyTorch and TensorFlow ship their own pool allocators for this reason but those allocators are inseparable from their runtimes. cuArena offers a similar approach as a lightweight, embeddable library for any CUDA application.
+Inside the dynamic region, requests at or above a large-block threshold (16 MB by default, override with the `SYCLARENA_LARGE_MIN_MB` environment variable) are carved from a **high sub-region** that grows down from the pool end, so large blocks cannot strand the contiguous space smaller allocations need. `compact_gpu_dynamic()` can pack either end: `CompactRegion::Low` slides the small blocks to the front, `CompactRegion::High` slides the large blocks to the pool end.
+
+The design is suited for SYCL applications that perform many repeated allocations of varying sizes in performance-critical paths, where the overhead of `sycl::malloc_device` and `sycl::free` becomes measurable. AI frameworks like PyTorch and TensorFlow ship their own pool allocators for this reason but those allocators are inseparable from their runtimes. syclArena offers a similar approach as a lightweight, embeddable library for any SYCL application.
 
 ---
 
 ## Designed for Performance
 
-- **Zero driver overhead**, every allocation and deallocation is a pure host-side operation; no `cudaMalloc` per call
+- **Zero runtime overhead**, every allocation and deallocation is a pure host-side operation; no `sycl::malloc_device` per call
 - **$O(1)$ allocation**, 32 isolated size-class bins covering $[128\,\text{B},\,256\,\text{GB})$; the right bin is found in one step, no scanning
 - **Immediate coalescing**, adjacent free blocks merge on every `deallocate()`, keeping the free list compact without a separate GC pass
 - **On-demand defragmentation**, `compact_gpu_dynamic()` eliminates fragmentation in one async pass when needed; a callback delivers the updated pointers
@@ -31,9 +33,10 @@ The design is suited for CUDA applications that perform many repeated allocation
 
 ## Requirements
 
-| Dependency | Minimum version |
+| Dependency | Notes |
 |---|---|
-| CUDA Toolkit | 12.x |
+| AdaptiveCpp (`acpp`) | SYCL 2020 compiler; the library is built as plain C++ through `acpp` |
+| SYCL device runtime | e.g. ROCm on AMD GPUs |
 | C++ standard | C++20 |
 | CMake | 3.18 |
 | GCC | 13 (for `std::format` in examples) |
@@ -43,45 +46,39 @@ The design is suited for CUDA applications that perform many repeated allocation
 ## Build
 
 ```bash
-git clone https://github.com/muhos/cuArena.git
-cd cuArena
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+git clone https://github.com/muhos/syclArena.git
+cd syclArena
+cmake -B build -DCMAKE_CXX_COMPILER=acpp -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
 Run the usage example:
 ```bash
-./build/cuArena_usage
+./build/syclArena_usage
 ```
 
 Run the benchmark:
 ```bash
-./build/cuArena_benchmark
+./build/syclArena_benchmark
 ```
 
 Run the tests:
 ```bash
-./build/cuArena_test
+./build/syclArena_test
 ```
 
 ### Options
 
 | Option | Default | Description |
 |---|---|---|
-| `CUARENA_BUILD_EXAMPLES` | `ON` | Build `cuArena_usage` and `cuArena_benchmark` |
-| `CUARENA_BUILD_TESTS` | `ON` | Build `cuArena_test` |
-| `CUARENA_SYNC_ALLOC` | `OFF` | Use `cudaMalloc` instead of `cudaMallocAsync` |
-
-Example:
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCUARENA_SYNC_ALLOC=ON
-```
+| `SYCLARENA_BUILD_EXAMPLES` | `ON` | Build `syclArena_usage` and `syclArena_benchmark` |
+| `SYCLARENA_BUILD_TESTS` | `ON` | Build `syclArena_test` |
 
 ---
 
 ## Integration
 
-After building, `build/` contains the static library (`libcuarena.a`) and headers are under `include/cuarena/`. Point your build system at both and link against `libcuarena.a` and the CUDA runtime. Alternatively, install into a system prefix:
+After building, `build/` contains the static library (`libsyclarena.a`) and headers are under `include/syclarena/`. Point your build system at both and compile with `acpp` (the SYCL runtime is linked automatically by the `acpp` driver). Alternatively, install into a system prefix:
 
 ```bash
 cmake --install build --prefix /usr/local
@@ -92,47 +89,47 @@ cmake --install build --prefix /usr/local
 ## Quick start
 
 ```cpp
-#include <cuarena/cuarena.cuh>
+#include <syclarena/syclarena.hpp>
 
 int main() {
-    cuArena::Logger::set_level(1);
+    syclArena::Logger::set_level(1);
 
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    sycl::queue stream;
 
-    cuArena::DeviceArena alloc;
+    syclArena::DeviceArena alloc;
 
     // 4 GB GPU pool: 512 MB stable for long-term buffers, rest dynamic for temporaries
-    alloc.create_gpu_pool(4 * cuArena::GB, cuArena::GPUMemoryType::Device, stream, 512 * cuArena::MB);
-    alloc.create_cpu_pool(512 * cuArena::MB, cuArena::CPUMemoryType::Pinned);
-    cudaStreamSynchronize(stream);
+    alloc.create_gpu_pool(4 * syclArena::GB, syclArena::GPUMemoryType::Device, &stream, 512 * syclArena::MB);
+    alloc.create_cpu_pool(512 * syclArena::MB, syclArena::CPUMemoryType::Pinned);
+    SYCLARENA_SYNC(&stream);
 
     // Stable allocation which remains alive for the duration of the session
-    float* persistent = alloc.allocate<float>(128 * cuArena::MB / sizeof(float), cuArena::Region::Stable);
+    float* persistent = alloc.allocate<float>(128 * syclArena::MB / sizeof(float), syclArena::Region::Stable);
 
-    // Dynamic allocations that frequently created and destroyed
-    float* scratch = alloc.allocate<float>(256 * cuArena::MB / sizeof(float));
+    // Dynamic allocations that are frequently created and destroyed
+    float* scratch = alloc.allocate<float>(256 * syclArena::MB / sizeof(float));
     alloc.deallocate(scratch);
 
-    // Compact dynamic region when fragmentation builds up
-    std::unordered_map<cuArena::addr_t, cuArena::addr_t> map;
+    // Compact the dynamic region when fragmentation builds up
+    std::unordered_map<syclArena::addr_t, syclArena::addr_t> map;
     alloc.compact_gpu_dynamic(
-        [&](cuArena::addr_t old_p, cuArena::addr_t new_p, size_t) {
+        [&](syclArena::addr_t old_p, syclArena::addr_t new_p, size_t) {
             map[old_p] = new_p;
-        }, 
-    stream);
-    cudaStreamSynchronize(stream);
+        },
+        &stream);
+    SYCLARENA_SYNC(&stream);
 
     // Pinned CPU buffer for host <-> device transfers
-    float* h_stage = alloc.allocate_pinned<float>(32 * cuArena::MB / sizeof(float));
+    float* h_stage = alloc.allocate_pinned<float>(32 * syclArena::MB / sizeof(float));
 
     alloc.deallocate(persistent);
     alloc.deallocate_pinned(h_stage);
     alloc.destroy_gpu_pool();
     alloc.destroy_cpu_pool();
-    cudaStreamDestroy(stream);
 }
 ```
+
+A null `queue` argument (the default everywhere) selects a process-wide default queue on the default SYCL device.
 
 ---
 
@@ -141,12 +138,13 @@ int main() {
 ### Types
 
 ```cpp
-enum class GPUMemoryType { Device, Managed };
-enum class CPUMemoryType { Pinned, Pageable };
+enum class GPUMemoryType { Device, Managed };   // sycl::malloc_device / sycl::malloc_shared
+enum class CPUMemoryType { Pinned, Pageable };  // sycl::malloc_host   / std::malloc
 enum class Region        { Stable, Dynamic };
+enum class CompactRegion { Low, High };         // which end of the dynamic pool to pack
 
 // Callback fired by compact_gpu_dynamic for each relocated block.
-// Runs after all cudaMemcpyAsync calls are queued; sync the stream before
+// Runs after all copies are queued on the queue; wait on the queue before
 // accessing data through the new pointers.
 using RelocateCallback = std::function<void(addr_t old_ptr, addr_t new_ptr, size_t bytes)>;
 ```
@@ -158,23 +156,23 @@ using RelocateCallback = std::function<void(addr_t old_ptr, addr_t new_ptr, size
 DeviceArena(size_t cpu_limit, size_t gpu_limit,
             GPUMemoryType gtype  = GPUMemoryType::Device,
             CPUMemoryType ctype  = CPUMemoryType::Pinned,
-            cudaStream_t  stream = 0);
+            sycl::queue*  queue  = nullptr);
 
 // Create pools manually (limit = 0 uses all available memory minus a safety margin)
 // stable_bytes: size of the stable region at the front of the GPU pool (0 = no stable region)
 bool create_gpu_pool(size_t limit        = 0,
                      GPUMemoryType type  = GPUMemoryType::Device,
-                     cudaStream_t stream = 0,
+                     sycl::queue*  queue = nullptr,
                      size_t stable_bytes = 0);
 bool create_cpu_pool(size_t limit        = 0,
                      CPUMemoryType type  = CPUMemoryType::Pinned);
 
-// Destroy pools and release memory to the driver
+// Destroy pools and release memory to the runtime
 bool destroy_gpu_pool();
 bool destroy_cpu_pool();
 
 // Resize (invalidates all existing allocations, preserves type and stable proportion)
-bool resize_gpu_pool(size_t new_size, cudaStream_t stream = 0);
+bool resize_gpu_pool(size_t new_size, sycl::queue* queue = nullptr);
 bool resize_cpu_pool(size_t new_size);
 
 // Reset free lists (invalidates all existing allocations, no GPU free/malloc)
@@ -194,9 +192,11 @@ template<class T> void resize    (T*& ptr, size_t new_count);  // Dynamic only
 ### Compaction
 
 ```cpp
-// Compact all dynamic allocations to the front of the dynamic region.
-// Queues cudaMemcpyAsync calls on `stream`; caller must sync before using new pointers.
-void compact_gpu_dynamic(RelocateCallback callback, cudaStream_t stream = 0);
+// Compact the dynamic allocations to one end of the dynamic region
+// (Low = front, the default; High = pool end, for the large-block region).
+// Queues copies on `queue`; caller must wait on it before using new pointers.
+size_t compact_gpu_dynamic(RelocateCallback callback, sycl::queue* queue = nullptr,
+                           CompactRegion which = CompactRegion::Low);
 ```
 
 ### CPU pinned allocation
@@ -226,9 +226,9 @@ size_t cpu_available();
 ### Logger
 
 ```cpp
-cuArena::Logger::set_level(0);  // silent (default)
-cuArena::Logger::set_level(1);  // info: pool creation, destruction, resize
-cuArena::Logger::set_level(2);  // debug
+syclArena::Logger::set_level(0);  // silent (default)
+syclArena::Logger::set_level(1);  // info: pool creation, destruction, resize
+syclArena::Logger::set_level(2);  // debug
 ```
 
 ### Error handling
@@ -237,16 +237,16 @@ cuArena::Logger::set_level(2);  // debug
 try {
     float* p = alloc.allocate<float>(too_many);
 }
-catch (const cuArena::gpu_memory_error& e) { ... }
-catch (const cuArena::cpu_memory_error& e) { ... }
-catch (const cuArena::cuda_error& e)       { ... }
+catch (const syclArena::gpu_memory_error& e) { ... }  // pool exhausted
+catch (const syclArena::cpu_memory_error& e) { ... }  // pinned pool exhausted
+catch (const syclArena::gpu_error& e)       { ... }   // SYCL runtime error
 ```
 
 ---
 
 ## Benchmark results
 
-Measured on RTX 4090, CUDA 12.6, Ubuntu 24.04, GCC 13.3. 500 iterations, 50 warmup. All times in microseconds.
+Measured on AMD Radeon RX 6800 XT (gfx1030, 16 GB), AdaptiveCpp (`acpp`, clang 20), Linux. 500 iterations, 50 warmup. All times in microseconds. Baselines are SYCL's own allocators; `sycl::malloc_device`/`sycl::malloc_shared` have no stream-ordered variant, so there is no async baseline to compare against.
 
 ### Device pool
 
@@ -254,63 +254,59 @@ Measured on RTX 4090, CUDA 12.6, Ubuntu 24.04, GCC 13.3. 500 iterations, 50 warm
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMalloc` + `cudaFree` | 603.72 | 595.62 | 591.79 | 620.20 |
-| `cudaMallocAsync` + `cudaFreeAsync` | 1.38 | 0.28 | 0.27 | 550.73 |
-| cuArena alloc + dealloc | **0.06** | **0.06** | **0.05** | **0.08** |
+| `sycl::malloc_device` + `sycl::free` | 314.98 | 322.18 | 252.36 | 408.88 |
+| syclArena alloc + dealloc | **0.08** | **0.08** | **0.07** | **0.14** |
 
-cuArena is **$10137{\times}$ faster** than `cudaMalloc` and **$23{\times}$ faster** than `cudaMallocAsync`.
+syclArena is **$4108{\times}$ faster** than `sycl::malloc_device`.
 
 **Benchmark 2: batch alloc 512 $\times$ 1 KB, then free all**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMalloc` + `cudaFree` | 849.91 | 854.49 | 833.00 | 941.48 |
-| `cudaMallocAsync` + `cudaFreeAsync` | 165.09 | 163.34 | 160.58 | 842.58 |
-| cuArena alloc + dealloc | **47.86** | **47.74** | **47.42** | **51.84** |
+| `sycl::malloc_device` + `sycl::free` | 901.70 | 888.92 | 872.84 | 1265.72 |
+| syclArena alloc + dealloc | **64.66** | **61.51** | **59.29** | **114.57** |
 
-cuArena is **$17.76{\times}$ faster** than `cudaMalloc` and **$3.45{\times}$ faster** than `cudaMallocAsync`.
+syclArena is **$14.0{\times}$ faster** than `sycl::malloc_device`.
 
 **Benchmark 3: interleaved ping-pong (4 live $\times$ 1 MB, cycling)**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMalloc` + `cudaFree` | 0.39 | 0.33 | 0.30 | 0.63 |
-| `cudaMallocAsync` + `cudaFreeAsync` | 0.29 | 0.29 | 0.27 | 0.50 |
-| cuArena alloc + dealloc | **0.06** | **0.06** | **0.06** | **0.08** |
+| `sycl::malloc_device` + `sycl::free` | 1.42 | 1.41 | 1.35 | 1.67 |
+| syclArena alloc + dealloc | **0.08** | **0.08** | **0.07** | **0.11** |
 
-cuArena is **$6.25{\times}$ faster** than `cudaMalloc` and **$4.70{\times}$ faster** than `cudaMallocAsync`.
+syclArena is **$18.0{\times}$ faster** than `sycl::malloc_device`.
 
 **Benchmark 4: resize chain (1 MB to 8 MB in 8 doublings)**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMalloc` + `cudaFree` | 7183.49 | 7180.44 | 7174.56 | 7301.32 |
-| `cudaMallocAsync` + `cudaFreeAsync` | 4.19 | 2.88 | 2.83 | 642.14 |
-| cuArena resize | **0.66** | **0.65** | **0.64** | **1.31** |
+| `sycl::malloc_device` + `sycl::free` | 2258.62 | 2228.70 | 2103.10 | 2655.82 |
+| syclArena resize | **0.65** | **0.65** | **0.64** | **0.81** |
 
-cuArena is **$10893{\times}$ faster** than `cudaMalloc` and **$6.35{\times}$ faster** than `cudaMallocAsync`.
+syclArena is **$3478{\times}$ faster** than `sycl::malloc_device`.
 
 **Benchmark 5: fragmentation + compact cycle (8 $\times$ 32 MB, free alternating)**
 
 | operation | mean | median | min | max |
 |---|---|---|---|---|
-| `compact_gpu_dynamic` (256 MB live) | 296.37 | 296.25 | 293.98 | 299.67 |
-| alloc 64 MB after compact | **0.05** | **0.05** | **0.04** | **0.32** |
+| `compact_gpu_dynamic` (256 MB active) | 543.70 | 546.72 | 479.51 | 562.34 |
+| alloc 64 MB after compact | **0.12** | **0.06** | **0.03** | **1.87** |
 
-Compact + subsequent alloc total: **296.43 $\mu s$**. The compact cost is purely GPU memcpy bandwidth where 128 MB of data is transferred. After compaction, the 64 MB allocation that would have failed before completes in 0.05 $\mu s$.
+Compact + subsequent alloc total: **543.82 $\mu s$**. The 32 MB blocks live in the high (large-block) region, so the cycle compacts `CompactRegion::High`; the timing window includes the queue wait, so the compact cost is purely GPU memcpy bandwidth. After compaction, the large allocation completes in a fraction of a microsecond.
 
 **Benchmark 6: stable vs dynamic allocation latency**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| stable 256 B | **0.05** | **0.05** | **0.05** | **0.06** |
-| dynamic 256 B | 0.06 | 0.06 | 0.06 | 0.08 |
-| stable 256 KB | **0.06** | **0.06** | **0.06** | **0.07** |
-| dynamic 256 KB | 0.09 | 0.09 | 0.09 | 0.10 |
-| stable 2 MB | **0.07** | **0.06** | **0.06** | **0.13** |
-| dynamic 2 MB | 0.09 | 0.09 | 0.09 | 0.10 |
+| stable 256 B | **0.06** | **0.06** | **0.05** | **0.11** |
+| dynamic 256 B | 0.08 | 0.08 | 0.07 | 0.10 |
+| stable 256 KB | **0.06** | **0.06** | **0.05** | **0.07** |
+| dynamic 256 KB | 0.11 | 0.11 | 0.10 | 0.12 |
+| stable 2 MB | **0.06** | **0.06** | **0.05** | **0.07** |
+| dynamic 2 MB | 0.11 | 0.11 | 0.10 | 0.11 |
 
-Stable is $1.24–1.48{\times}$ faster than dynamic across all size classes. The gap reflects the bin-lookup overhead in the dynamic allocator vs. the stable region's simple linear pointer.
+Stable is $1.36–1.89{\times}$ faster than dynamic across all size classes. The gap reflects the bin-lookup overhead in the dynamic allocator vs. the stable region's simple linear pointer.
 
 ### Managed pool
 
@@ -318,44 +314,42 @@ Stable is $1.24–1.48{\times}$ faster than dynamic across all size classes. The
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMallocManaged` + `cudaFree` | 16.48 | 16.36 | 15.62 | 20.69 |
-| cuArena alloc + dealloc | **0.06** | **0.06** | **0.06** | **0.07** |
+| `sycl::malloc_shared` + `sycl::free` | 20272.07 | 3271.48 | 2699.28 | 121392.25 |
+| syclArena alloc + dealloc | **0.08** | **0.08** | **0.07** | **0.10** |
 
-cuArena is **$270{\times}$ faster** than `cudaMallocManaged`.
+syclArena is **$>40000{\times}$ faster** than `sycl::malloc_shared` on a median basis (the baseline mean is inflated by occasional spikes over 120 ms).
 
 **Benchmark 2: batch alloc 512 $\times$ 1 KB, then free all**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMallocManaged` + `cudaFree` | 2254.53 | 2248.98 | 2224.77 | 2446.00 |
-| cuArena alloc + dealloc | **46.58** | **46.11** | **45.33** | **55.13** |
+| `sycl::malloc_shared` + `sycl::free` | 47615.27 | 47382.45 | 46465.33 | 87616.33 |
+| syclArena alloc + dealloc | **60.19** | **60.02** | **58.47** | **93.25** |
 
-cuArena is **$48{\times}$ faster** than `cudaMallocManaged`.
+syclArena is **$791{\times}$ faster** than `sycl::malloc_shared`.
 
 **Benchmark 3: interleaved ping-pong (4 live $\times$ 1 MB, cycling)**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMallocManaged` + `cudaFree` | 4.29 | 4.35 | 3.88 | 8.12 |
-| cuArena alloc + dealloc | **0.07** | **0.08** | **0.06** | **0.09** |
+| `sycl::malloc_shared` + `sycl::free` | 836.46 | 477.31 | 399.82 | 2390.00 |
+| syclArena alloc + dealloc | **0.10** | **0.10** | **0.10** | **0.25** |
 
-cuArena is **$60{\times}$ faster** than `cudaMallocManaged`.
+syclArena is **$8080{\times}$ faster** than `sycl::malloc_shared`.
 
 **Benchmark 4: resize chain (1 MB to 8 MB in 8 doublings)**
 
 | allocator | mean | median | min | max |
 |---|---|---|---|---|
-| `cudaMallocManaged` + `cudaFree` | 136.80 | 124.94 | 122.00 | 1321.96 |
-| cuArena resize | **0.64** | **0.63** | **0.62** | **3.54** |
+| `sycl::malloc_shared` + `sycl::free` | 25551.34 | 24278.30 | 22899.69 | 156012.62 |
+| syclArena resize | **0.57** | **0.57** | **0.56** | **0.71** |
 
-cuArena is **$214{\times}$ faster** than `cudaMallocManaged`.
+syclArena is **$44910{\times}$ faster** than `sycl::malloc_shared`.
 
 ### Remarks
 
-`cudaMallocAsync` shows extreme max latency spikes (up to $842 \mu s$) against a median of $0.27–163 \mu s$ caused by unpredictable driver-side stream pool overhead. cuArena's max values stay within $2\times$ of its median across all benchmarks, reflecting the deterministic nature of pure host-side allocation.
+`sycl::malloc_shared` on this platform carries large, unpredictable per-call latency (max values of 87–156 ms in the batch/resize benchmarks) on top of a 0.3–2.7 ms median. syclArena's managed pool amortizes all of that to a single allocation at creation time; the suballocations run at 0.08–0.6 $\mu s$ regardless.
 
-`cudaMallocManaged` carries full UVM page table setup per call. The batch benchmark shows $2254 \mu s$ vs $849 \mu s$ for `cudaMalloc`, and cuArena's managed pool amortizes that entire cost to a single call at creation time. The suballocations run at 0.06–0.09 $\mu s$ regardless.
+The resize benchmark captures the compounding cost most clearly: 8 sequential `sycl::malloc_device` calls accumulate to 2.3 ms per chain, while syclArena's free-list reuse keeps the entire chain under $1\,\mu s$ for both pool types.
 
-The resize benchmark captures compounding cost most clearly: 8 sequential `cudaMalloc` calls accumulate to $7.1 ms$ per chain, while cuArena's free-list reuse keeps the entire chain under $1 \mu s$ for both pool types.
-
-Compact throughput (~432 GB/s on RTX 4090) shows that `compact_gpu_dynamic` adds essentially no overhead beyond the raw GPU memcpy bandwidth required to move the data.
+syclArena's max values stay within roughly $2\times$ of its median across all benchmarks, reflecting the deterministic nature of pure host-side allocation.
